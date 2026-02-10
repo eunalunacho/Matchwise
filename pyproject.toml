@@ -1,0 +1,26 @@
+[project]
+name = "matchwise"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "boto3>=1.42.45",
+    "fastapi>=0.128.6",
+    "langchain>=1.2.9",
+    "langchain-anthropic>=1.3.2",
+    "langchain-openai>=1.1.8",
+    "langchain-pinecone>=0.2.13",
+    "langgraph>=1.0.8",
+    "lxml>=6.0.2",
+    "mangum>=0.21.0",
+    "openai>=2.18.0",
+    "pinecone-client>=6.0.0",
+    "playwright>=1.58.0",
+    "pydantic>=2.12.5",
+    "pytest>=9.0.2",
+    "python-dotenv>=1.2.1",
+    "slack-bolt>=1.27.0",
+    "slack-sdk>=3.39.0",
+    "uvicorn>=0.40.0",
+]
