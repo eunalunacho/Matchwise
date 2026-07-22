@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}프로필 관리 — MatchWise{% endblock %}
+{% block content %}
+<h2>프로필 관리</h2>
+{% if not users %}
+<p>등록된 사용자가 없습니다. 관리자가 <code>scripts/add_user.py</code>로 추가해주세요.</p>
+{% endif %}
+{% for user in users %}
+<div class="card">
+  <h3>{{ user.username }} <small style="color:#6b7280; font-size:0.8rem;">Discord: {{ user.discord_id }}</small></h3>
+  <details>
+    <summary>이력서 수정</summary>
+    <form method="post" action="/profile/{{ user.discord_id }}/resume" style="margin-top:0.5rem;">
+      <textarea name="resume_text" rows="10" placeholder="이력서 텍스트를 붙여넣으세요">{{ user.resume_text or '' }}</textarea>
+      <button class="btn" type="submit">저장</button>
+    </form>
+  </details>
+  <details>
+    <summary>경험 텍스트 수정 (협업, 갈등 해결, 학창시절 등)</summary>
+    <form method="post" action="/profile/{{ user.discord_id }}/experience" style="margin-top:0.5rem;">
+      <textarea name="experience_text" rows="10" placeholder="자유 형식으로 경험을 작성하세요">{{ user.experience_text or '' }}</textarea>
+      <button class="btn" type="submit">저장</button>
+    </form>
+  </details>
+</div>
+{% endfor %}
+{% endblock %}

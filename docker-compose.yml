@@ -1,0 +1,87 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: matchwise
+      POSTGRES_USER: matchwise
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-matchwise_dev}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U matchwise"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - matchwise-net
+
+  web-api:
+    build:
+      context: .
+      target: web
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql://matchwise:${POSTGRES_PASSWORD:-matchwise_dev}@postgres:5432/matchwise
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - matchwise-net
+
+  discord-bot:
+    build:
+      context: .
+      target: bot
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql://matchwise:${POSTGRES_PASSWORD:-matchwise_dev}@postgres:5432/matchwise
+      - WEB_BASE_URL=http://${EC2_HOST:-localhost}:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - matchwise-net
+
+  scheduler:
+    build:
+      context: .
+      target: scheduler
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql://matchwise:${POSTGRES_PASSWORD:-matchwise_dev}@postgres:5432/matchwise
+      - WEB_BASE_URL=http://${EC2_HOST:-localhost}:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - matchwise-net
+
+  crawler:
+    build:
+      context: .
+      target: crawler
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql://matchwise:${POSTGRES_PASSWORD:-matchwise_dev}@postgres:5432/matchwise
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - crawl
+    deploy:
+      resources:
+        limits:
+          memory: 1500m
+    networks:
+      - matchwise-net
+
+volumes:
+  postgres-data:
+
+networks:
+  matchwise-net:
+    driver: bridge

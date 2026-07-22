@@ -37,58 +37,6 @@ class Environment(str, Enum):
 # ──────────────────────────────────────────────
 
 
-class AWSSettings(BaseSettings):
-    """AWS 관련 설정.
-
-    Lambda/ECS에서는 IAM Role을 사용하므로 키가 선택사항.
-    """
-
-    model_config = SettingsConfigDict(
-        env_prefix="AWS_",
-        env_file=_ENV_FILE,
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
-
-    region: str = "ap-northeast-2"
-    access_key_id: SecretStr | None = None
-    secret_access_key: SecretStr | None = None
-    s3_bucket: str = "matchwise-data"
-    dynamodb_table_prefix: str = "matchwise"
-
-
-class PineconeSettings(BaseSettings):
-    """Pinecone Vector DB 설정."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="PINECONE_",
-        env_file=_ENV_FILE,
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
-
-    api_key: SecretStr
-    environment: str = "us-east-1"
-    index_name: str = "matchwise-jobs"
-
-
-class OpenAISettings(BaseSettings):
-    """OpenAI API 설정."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="OPENAI_",
-        env_file=_ENV_FILE,
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
-
-    api_key: SecretStr
-    llm_model: str = "gpt-4o-mini"
-    embedding_model: str = "text-embedding-3-small"
-    embedding_dimensions: int = 1536
-    max_retries: int = 3
-    request_timeout: int = 60
-
 
 class GeminiSettings(BaseSettings):
     """Google Gemini 설정 (선택, 대체 LLM)."""
@@ -101,36 +49,49 @@ class GeminiSettings(BaseSettings):
     )
 
     api_key: SecretStr | None = None
+    model: str = "gemini-2.5-flash"
 
 
-class SlackSettings(BaseSettings):
-    """Slack Bot 설정."""
+class DartSettings(BaseSettings):
+    """금융감독원 DART OpenAPI 설정."""
 
     model_config = SettingsConfigDict(
-        env_prefix="SLACK_",
+        env_prefix="DART_",
         env_file=_ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
     )
 
-    bot_token: SecretStr
-    app_token: SecretStr
-    signing_secret: SecretStr
-    channel: str = "matchwise"
+    api_key: SecretStr | None = None
+    cache_dir: str = ".dart_cache"
 
 
-class SentrySettings(BaseSettings):
-    """Sentry 모니터링 설정 (선택)."""
+class DiscordSettings(BaseSettings):
+    """Discord Bot 설정."""
 
     model_config = SettingsConfigDict(
-        env_prefix="SENTRY_",
+        env_prefix="DISCORD_",
         env_file=_ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
     )
 
-    dsn: str | None = None
-    traces_sample_rate: float = 0.1
+    bot_token: SecretStr = SecretStr("dummy")
+    guild_id: int | None = None
+
+
+class DatabaseSettings(BaseSettings):
+    """PostgreSQL + 앱 URL 설정."""
+
+    model_config = SettingsConfigDict(
+        env_file=_ENV_FILE,
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    database_url: str = "sqlite:///./matchwise_dev.db"
+    web_base_url: str = "http://localhost:8000"
+
 
 
 # ──────────────────────────────────────────────
@@ -175,11 +136,7 @@ class AnalysisConfig(BaseModel):
 
 
 class Settings(BaseSettings):
-    """MatchWise 전체 설정.
-
-    `.env` 파일에서 환경변수를 자동으로 읽고 검증한다.
-    하위 서비스 설정은 각각의 env_prefix로 매핑된다.
-    """
+    """MatchWise 전체 설정."""
 
     model_config = SettingsConfigDict(
         env_file=_ENV_FILE,
@@ -187,33 +144,25 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # 환경/디버그
     env: Environment = Environment.DEV
     debug: bool = False
     log_level: str = "INFO"
     app_name: str = "matchwise"
 
-    # 외부 서비스
-    aws: AWSSettings = AWSSettings()
-    pinecone: PineconeSettings = PineconeSettings()
-    openai: OpenAISettings = OpenAISettings()
     gemini: GeminiSettings = GeminiSettings()
-    slack: SlackSettings = SlackSettings()
-    sentry: SentrySettings = SentrySettings()
-
-    # 내부 설정
+    dart: DartSettings = DartSettings()
+    discord: DiscordSettings = DiscordSettings()
+    db: DatabaseSettings = DatabaseSettings()
     crawling: CrawlingConfig = CrawlingConfig()
     schedule: ScheduleConfig = ScheduleConfig()
     analysis: AnalysisConfig = AnalysisConfig()
 
     @property
     def is_prod(self) -> bool:
-        """프로덕션 환경 여부."""
         return self.env == Environment.PROD
 
     @property
     def is_dev(self) -> bool:
-        """개발 환경 여부."""
         return self.env == Environment.DEV
 
 

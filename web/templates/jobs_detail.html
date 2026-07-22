@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}[{{ job.company }}] {{ job.title }} — MatchWise{% endblock %}
+{% block content %}
+<h2>
+  [{{ job.company }}] {{ job.title }}
+  {%- if summary.employment_type %} ({{ summary.employment_type }}){% endif %}
+</h2>
+<p><a href="{{ job.url }}" target="_blank">공고 원문 →</a></p>
+
+{% if summary.tasks %}
+<div class="card">
+  <h3>💼 하는 일</h3>
+  <ul>{% for t in summary.tasks %}<li>{{ t }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+
+{% if summary.qualifications or summary.preferred or summary.stack %}
+<div class="card">
+  {% if summary.qualifications %}
+  <h3>✅ 자격요건</h3>
+  <ul>{% for q in summary.qualifications %}<li>{{ q }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% if summary.preferred %}
+  <h3>⭐ 우대사항</h3>
+  <ul>{% for p in summary.preferred %}<li>{{ p }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% if summary.stack %}
+  <h3>🛠 스택</h3>
+  <p>{% for s in summary.stack %}<span class="tag">{{ s }}</span>{% endfor %}</p>
+  {% endif %}
+</div>
+{% endif %}
+
+<h3>유저별 적합도</h3>
+<table>
+  <thead><tr><th>유저</th><th>적합도</th><th>기업점수</th><th>매칭 이유</th></tr></thead>
+  <tbody>
+    {% for score, user in scores %}
+    <tr>
+      <td>{{ user.username }}</td>
+      <td>{{ score.fit_score }}</td>
+      <td>{{ score.company_score }}</td>
+      <td>{{ score.fit_reasons }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="4">아직 분석되지 않았습니다.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h3>JD 원문</h3>
+<pre style="white-space:pre-wrap; border:1px solid #e5e7eb; padding:1rem; border-radius:4px;">{{ job.jd_text }}</pre>
+
+<h3>지원 질문 등록</h3>
+{% if questions %}
+<ul>{% for q in questions %}<li>{{ q.question }}</li>{% endfor %}</ul>
+<p><a class="btn" href="/draft/{{ job.id }}">초안 보기 →</a></p>
+{% endif %}
+<form method="post" action="/jobs/{{ job.id }}/questions">
+  <textarea name="questions" rows="6"
+    placeholder="질문을 한 줄에 하나씩 입력하세요. 저장 시 기존 질문은 덮어씁니다.">{% for q in questions %}{{ q.question }}
+{% endfor %}</textarea>
+  <button class="btn" type="submit">저장</button>
+</form>
+{% endblock %}

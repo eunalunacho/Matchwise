@@ -9,3 +9,22 @@ wheels/
 # Virtual environments
 .venv
 .env
+
+CLAUDE.md
+DEVELOPMENT_CHECKLIST.md
+
+# Gmail OAuth
+credentials.json
+token.json
+
+# 개인 데이터
+profile.json
+3월_실습일지.md
+
+# 런타임
+logs/
+memory/
+
+# 로컬 개발 DB / 브라우저 자동화 산출물
+*.db
+.playwright-mcp/

@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}[{{ job.company }}] {{ job.title }} 초안 — MatchWise{% endblock %}
+{% block content %}
+<h2>[{{ job.company }}] {{ job.title }} — 이력서 초안</h2>
+<p><a href="{{ job.url }}" target="_blank">공고 원문 →</a> | <a href="/jobs/{{ job.id }}">공고 상세</a></p>
+
+{% if not drafts_by_q %}
+<p>아직 초안이 없습니다. Discord에서 [이력서 작성하기] 버튼을 눌러주세요.</p>
+{% endif %}
+
+{% for q_id, data in drafts_by_q.items() %}
+<div class="card">
+  <h3>Q. {{ data.question }}</h3>
+  {% for draft, user in data.drafts %}
+  <div style="margin-top:1rem; padding-left:1rem; border-left:4px solid #4f46e5;">
+    <strong>{{ user.username }}</strong>
+    <pre id="draft-{{ draft.id }}"
+         style="white-space:pre-wrap; font-family:sans-serif; margin:0.5rem 0;">{{ draft.answer }}</pre>
+    <button class="btn"
+            onclick="navigator.clipboard.writeText(document.getElementById('draft-{{ draft.id }}').textContent)">
+      복사
+    </button>
+  </div>
+  {% else %}
+  <p style="color:#6b7280;">아직 이 질문에 대한 초안이 없습니다.</p>
+  {% endfor %}
+</div>
+{% endfor %}
+{% endblock %}

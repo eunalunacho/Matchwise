@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}대시보드 — MatchWise{% endblock %}
+{% block content %}
+<h2>공고 대시보드</h2>
+
+{% if sources %}
+<div class="filters">
+  <a href="/dashboard" class="{{ 'active' if not active_source }}">전체</a>
+  {% for s in sources %}
+  <a href="/dashboard?source={{ s }}" class="{{ 'active' if active_source == s }}">{{ s }}</a>
+  {% endfor %}
+</div>
+{% endif %}
+
+<table>
+  <thead>
+    <tr><th>회사</th><th>포지션</th><th>출처</th><th>적합도</th><th>기업점수</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for job, score in jobs %}
+    <tr>
+      <td>{{ job.company or '-' }}</td>
+      <td>{{ job.title or '-' }}</td>
+      <td>{{ job.source }}</td>
+      <td class="
+        {%- if score and score.fit_score >= 80 %}score-hi
+        {%- elif score and score.fit_score >= 60 %}score-md
+        {%- else %}score-lo{%- endif %}">
+        {{ score.fit_score if score else '-' }}
+      </td>
+      <td>{{ score.company_score if score else '-' }}</td>
+      <td><a class="btn" href="/jobs/{{ job.id }}">상세</a></td>
+    </tr>
+    {% else %}
+    <tr><td colspan="6">아직 수집된 공고가 없습니다.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
