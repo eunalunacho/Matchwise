@@ -80,8 +80,7 @@ class DiscordSettings(BaseSettings):
     guild_id: int | None = None
     client_id: str | None = None
     client_secret: SecretStr | None = None
-    # 매일 매칭 공고(뉴스레터)를 보낼 채널 ID (DISCORD_MATCH_CHANNEL_ID). 없으면 매칭 알림 생략.
-    match_channel_id: int | None = None
+    # 매칭 공고 채널은 사용자마다 다르므로 env가 아니라 users.match_channel_id에 둔다(2026-10-15).
     # 수집 파이프라인 진행 알림을 보낼 비공개 채널 웹훅 (DISCORD_INGEST_WEBHOOK_URL). 없으면 전송 안 함.
     ingest_webhook_url: SecretStr | None = None
 

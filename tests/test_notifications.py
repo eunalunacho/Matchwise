@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import discord
 import pytest
 
-from db.orm import Job, JobScore, User
+from db.orm import Application, Job, JobScore, User
 from bot.notifications import MIN_FIT_SCORE, format_job_message, send_daily_notifications
 
 
@@ -186,14 +186,13 @@ def test_buttons_are_view_details_add_to_list_and_pass():
     assert custom_ids == {"will_apply:7:42", "dislike:7:42"}
 
 
-# ── send_daily_notifications: 매칭 채널 ──────────────────────────────────────
+# ── send_daily_notifications: 사용자별 매칭 채널 ──────────────────────────────
 
-CHANNEL_ID = 555
+CHANNEL_ID = "555"
 
 
-def _settings(channel_id=CHANNEL_ID) -> MagicMock:
+def _settings() -> MagicMock:
     settings = MagicMock()
-    settings.discord.match_channel_id = channel_id
     settings.discord.bot_token.get_secret_value.return_value = "token"
     return settings
 
@@ -220,28 +219,27 @@ def _discord(sent: list):
     return client, channel, message
 
 
-def _seed(session, scores: list[tuple[int, str]], scored_at=None) -> User:
+def _seed(session, scores: list[tuple[int, str]], channel_id: str | None = CHANNEL_ID,
+          username: str = "tester") -> User:
     """(점수, 회사) 목록으로 공고·점수를 만든다. 직무명은 '직무-회사'."""
-    user = User(username="tester", is_active=True)
+    user = User(username=username, is_active=True, match_channel_id=channel_id)
     session.add(user)
     session.flush()
-    for i, (fit, company) in enumerate(scores):
-        job = Job(source="a", url=f"https://ex.com/{i}", title=f"공고 {company}", company=company)
+    for fit, company in scores:
+        job = Job(source="a", url=f"https://ex.com/{username}/{company}", title=f"공고 {company}", company=company)
         session.add(job)
         session.flush()
-        row = JobScore(job_id=job.id, user_id=user.id, fit_score=fit, fit_reasons="이유",
-                       fit_detail={"position": f"직무-{company}"})
-        if scored_at is not None:
-            row.scored_at = scored_at
-        session.add(row)
+        session.add(JobScore(job_id=job.id, user_id=user.id, fit_score=fit, fit_reasons="이유",
+                             fit_detail={"position": f"직무-{company}"}))
     session.commit()
     return user
 
 
-async def _run(session, sent, settings=None):
+async def _run(session, sent):
     client, channel, message = _discord(sent)
     with patch("bot.notifications.get_session", return_value=session), \
-         patch("bot.notifications.get_settings", return_value=settings or _settings()), \
+         patch.object(session, "close"), \
+         patch("bot.notifications.get_settings", return_value=_settings()), \
          patch("bot.notifications.discord.Client", return_value=client):
         await send_daily_notifications()
     return client, channel, message
@@ -252,12 +250,12 @@ def _cards(sent) -> list:
 
 
 @pytest.mark.asyncio
-async def test_notify_posts_header_and_top3_cards_to_match_channel(session):
+async def test_notify_posts_header_and_top3_cards_to_users_channel(session):
     _seed(session, [(90, "A"), (85, "B"), (80, "C")])
     sent = []
     client, _, message = await _run(session, sent)
 
-    client.fetch_channel.assert_awaited_once_with(CHANNEL_ID)
+    client.fetch_channel.assert_awaited_once_with(int(CHANNEL_ID))
     assert sent[0][0] == "channel" and "추천 공고 — 3건" in sent[0][1]["content"]
     assert [e.title for e in _cards(sent)] == ["[A] 직무-A", "[B] 직무-B", "[C] 직무-C"]
     message.create_thread.assert_not_called()  # 나머지가 없으면 스레드도 없음
@@ -274,56 +272,87 @@ async def test_notify_puts_the_rest_in_a_thread_as_one_line_links(session):
     assert any(where == "channel" and "나머지 2건" in (kw["content"] or "") for where, kw in sent)
     message.create_thread.assert_awaited_once()
     thread_text = "\n".join(kw["content"] for where, kw in sent if where == "thread")
-    assert "• [D — 직무-D](https://ex.com/3) · 82점" in thread_text
-    assert "• [E — 직무-E](https://ex.com/4) · 70점" in thread_text
+    assert "• [D — 직무-D](https://ex.com/tester/D) · 82점" in thread_text
+    assert "• [E — 직무-E](https://ex.com/tester/E) · 70점" in thread_text
     assert all(kw.get("suppress_embeds") for where, kw in sent if where == "thread")
 
 
 @pytest.mark.asyncio
-async def test_notify_only_includes_scores_made_today_and_above_minimum(session):
-    """이틀 전에 채점된 공고는 이미 알림으로 나갔다 — 오늘(KST 0시 이후) 채점된 것만 보낸다."""
-    old = datetime.now(timezone.utc) - timedelta(days=2)
-    user = _seed(session, [(99, "OLD")], scored_at=old)
-    new = Job(source="a", url="https://ex.com/new", title="t", company="NEW")
-    low = Job(source="a", url="https://ex.com/low", title="t", company="LOW")
-    session.add_all([new, low])
-    session.flush()
-    session.add_all([
-        JobScore(job_id=new.id, user_id=user.id, fit_score=80, fit_detail={"position": "p"}),
-        JobScore(job_id=low.id, user_id=user.id, fit_score=MIN_FIT_SCORE - 1),
-    ])
+async def test_notify_records_what_was_sent_and_never_resends(session):
+    """보낸 점수에 notified_at·방식이 남고, 다음 날(재채점해도) 다시 나가지 않는다."""
+    _seed(session, [(95, "A"), (90, "B"), (85, "C"), (82, "D")])
+    await _run(session, [])
+
+    rows = {s.job.company: s for s in session.query(JobScore).all()}
+    assert all(r.notified_at is not None for r in rows.values())
+    assert [rows[c].notified_as for c in "ABCD"] == ["card", "card", "card", "thread"]
+
+    rows["A"].scored_at = datetime.now(timezone.utc)  # 재채점
+    session.commit()
+    sent = []
+    await _run(session, sent)
+    assert _cards(sent) == []
+    assert "새 추천 공고 없음" in sent[0][1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_notify_skips_below_minimum_and_jobs_with_a_status(session):
+    """50점 미만, 이미 등록·패스한 공고는 보내지 않는다."""
+    user = _seed(session, [(80, "NEW"), (MIN_FIT_SCORE - 1, "LOW"), (90, "PASSED")])
+    passed = session.query(Job).filter_by(company="PASSED").one()
+    session.add(Application(job_id=passed.id, user_id=user.id, status="dismissed"))
     session.commit()
     sent = []
     await _run(session, sent)
 
-    assert [e.title for e in _cards(sent)] == ["[NEW] p"]
+    assert [e.title for e in _cards(sent)] == ["[NEW] 직무-NEW"]
 
 
 @pytest.mark.asyncio
-async def test_notify_says_so_when_no_new_recommendations(session):
-    _seed(session, [(MIN_FIT_SCORE - 10, "A")])
+async def test_notify_sends_each_user_to_their_own_channel_and_skips_users_without_one(session):
+    _seed(session, [(90, "A")], channel_id="555", username="a")
+    _seed(session, [(90, "B")], channel_id="777", username="b")
+    _seed(session, [(90, "C")], channel_id=None, username="c")
     sent = []
-    await _run(session, sent)
+    client, _, _ = await _run(session, sent)
 
-    assert len(sent) == 1
-    assert "추천 공고 없음" in sent[0][1]["content"]
+    assert [c.args[0] for c in client.fetch_channel.await_args_list] == [555, 777]
+    assert sorted(e.title for e in _cards(sent)) == ["[A] 직무-A", "[B] 직무-B"]
+    c_score = session.query(JobScore).join(Job).filter(Job.company == "C").one()
+    assert c_score.notified_at is None  # 채널이 생기면 그때 보낸다
 
 
 @pytest.mark.asyncio
-async def test_notify_skips_without_channel_id_and_does_not_log_in(session):
+async def test_notify_does_not_log_in_when_nobody_has_a_channel(session):
+    _seed(session, [(90, "A")], channel_id=None)
+    sent = []
+    with patch("bot.notifications.discord.Client") as client_cls, \
+         patch("bot.notifications.get_session", return_value=session), \
+         patch.object(session, "close"):
+        await send_daily_notifications()
+
+    client_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_notify_failure_leaves_scores_unsent_for_next_day(session):
     _seed(session, [(90, "A")])
-    sent = []
-    client, _, _ = await _run(session, sent, settings=_settings(channel_id=None))
+    client, channel, _ = _discord([])
+    channel.send.side_effect = RuntimeError("discord down")
+    with patch("bot.notifications.get_session", return_value=session), \
+         patch.object(session, "close"), \
+         patch("bot.notifications.get_settings", return_value=_settings()), \
+         patch("bot.notifications.discord.Client", return_value=client):
+        await send_daily_notifications()
 
-    client.login.assert_not_called()
-    assert sent == []
+    assert session.query(JobScore).one().notified_at is None
 
 
 @pytest.mark.asyncio
 async def test_notify_orders_by_fit_score_then_deadline_within_similar_tier(session):
     """fit_score가 우선이고, 점수가 비슷한(10점 단위 동일 구간) 것끼리만 마감 가까운 순으로 재정렬한다."""
     now = datetime.now(timezone.utc)
-    user = User(username="tester")
+    user = User(username="tester", match_channel_id=CHANNEL_ID)
     session.add(user)
     session.flush()
 

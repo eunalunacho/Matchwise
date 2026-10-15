@@ -9,7 +9,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from shared.config import get_settings
-from scheduler.jobs import cleanup_job, run_crawl_pipeline, analyze_job, notify_job
+from scheduler.jobs import assistant_job, cleanup_job, run_crawl_pipeline, analyze_job, notify_job
 from shared.logger import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -54,13 +54,23 @@ def main() -> None:
         max_instances=1,
         misfire_grace_time=300,
     )
+    # 매칭 알림 10분 뒤 — 마감 리마인드(매일)·3일 현황 요약을 DM으로 (bot/assistant.py)
+    scheduler.add_job(
+        assistant_job,
+        CronTrigger(hour=settings.schedule.brief_hour, minute=10, timezone=tz),
+        id="assistant",
+        name="비서 DM",
+        max_instances=1,
+        misfire_grace_time=600,
+    )
 
     logger.info(
-        "스케줄러 시작 (timezone=%s) — cleanup=%d:00, crawl=%d:00, analyze=%d:00, notify=%d:00",
+        "스케줄러 시작 (timezone=%s) — cleanup=%d:00, crawl=%d:00, analyze=%d:00, notify=%d:00, assistant=%d:10",
         tz,
         settings.schedule.cleanup_hour,
         settings.schedule.crawl_hour,
         settings.schedule.analyze_hour,
+        settings.schedule.brief_hour,
         settings.schedule.brief_hour,
     )
     scheduler.start()

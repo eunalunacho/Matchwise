@@ -22,14 +22,14 @@ from shared.db import get_session
 from shared.config import get_settings
 from bot import ingest_report
 from db.orm import (
-    Application, ApplicationQuestion, GeminiUsage, Job, RawPosting, ResumeDraft, User, JobScore,
+    Application, ApplicationEvent, ApplicationQuestion, GeminiUsage, Job, RawPosting, ResumeDraft, User, JobScore,
 )
 from crawler.base import BaseCrawler, RawJob
 from crawler.inthiswork import InthisworkCrawler
 from crawler.jasoseol import JasoseolCrawler
 from crawler.jobkorea import JobkoreaCrawler
 from analysis.profile import build_profile_text
-from analysis.scorer import score_fit, summarize_jd
+from analysis.scorer import SCORER_VERSION, score_fit, summarize_jd
 
 logger = logging.getLogger(__name__)
 
@@ -79,14 +79,15 @@ _OCR_SLICE_OVERLAP_PX = 200
 def cleanup_job() -> None:
     """01:00 KST — 마감(deadline) 지난 공고와 연관 데이터(점수·지원질문·초안) 삭제.
 
-    deadline이 없는 공고(크롤러가 파싱 못 한 경우)는 만료 여부를 판단할 수 없어 건드리지 않는다.
+    deadline이 없는 공고(크롤러·추출 모두 마감일을 못 찾은 경우)는 만료 여부를 판단할 수 없어 건드리지 않는다.
     지원 이력(applications)이 있는 공고는 사용자가 추적 중인 기록이라 마감이 지나도 보존한다.
+    단 패스(dismissed)만 있는 공고는 추적이 아니므로 지우고, 그 패스 기록(applications·application_events)도 함께 지운다.
     """
     logger.info("[cleanup] 시작")
     session = get_session()
     try:
         now = datetime.now(timezone.utc)
-        tracked_job_ids = session.query(Application.job_id)
+        tracked_job_ids = session.query(Application.job_id).filter(Application.status != "dismissed")
         expired_ids = [
             job_id for (job_id,) in session.query(Job.id)
             .filter(Job.deadline.isnot(None), Job.deadline < now)
@@ -99,6 +100,11 @@ def cleanup_job() -> None:
             return
 
         session.query(JobScore).filter(JobScore.job_id.in_(expired_ids)) \
+            .delete(synchronize_session=False)
+        dismissed_app_ids = session.query(Application.id).filter(Application.job_id.in_(expired_ids))
+        session.query(ApplicationEvent).filter(ApplicationEvent.application_id.in_(dismissed_app_ids)) \
+            .delete(synchronize_session=False)
+        session.query(Application).filter(Application.job_id.in_(expired_ids)) \
             .delete(synchronize_session=False)
         session.query(ApplicationQuestion).filter(ApplicationQuestion.job_id.in_(expired_ids)) \
             .delete(synchronize_session=False)
@@ -500,6 +506,9 @@ def extract_job() -> dict:
                 job.jd_preferred = summary["preferred"]
                 job.eligibility = summary["eligibility"]
                 job.work_locations = summary["locations"]
+                # 목록에 마감일이 없는 사이트(인디스워크)는 본문·OCR에 적힌 마감일로 채운다. 크롤러 값이 있으면 그대로 둔다.
+                if job.deadline is None and summary.get("deadline") is not None:
+                    job.deadline = summary["deadline"]
                 job.extract_status = "ok"
                 stats["ok"] += 1
             except Exception:
@@ -553,12 +562,26 @@ def _is_scoring_target(job: Job) -> bool:
     return True
 
 
+def _apply_score(row: JobScore, result: dict, user: User, now: datetime) -> None:
+    """score_fit 결과와 채점 버전을 점수 줄에 쓴다. 새 줄·재채점 모두 이 함수로 쓴다."""
+    row.fit_score = result["fit_score"]
+    row.fit_reasons = result.get("fit_reasons", "")
+    row.fit_detail = result.get("fit_detail")
+    row.profile_version = user.profile_version
+    row.scorer_version = SCORER_VERSION
+    row.scored_at = now
+    row.rescore_requested_at = None
+
+
 def analyze_job() -> None:
     """05:00 KST — (Job × User) 조합 fit_score 계산.
 
-    대상은 extract_job이 추출을 끝낸(extract_status='ok') 공고 중 _is_scoring_target을 통과한 것뿐이다.
-    pending(추출 전)·failed(추출 실패)는 카드 내용과 신입 여부를 몰라, needs_ocr/empty는 jd_text가 비어 제외한다.
-    이미 JobScore가 있는 (공고, 유저) 조합은 다시 채점하지 않는다.
+    1) 신규: extract_job이 추출을 끝낸(extract_status='ok') 공고 중 _is_scoring_target을 통과했고 아직 점수가 없는
+       (공고, 유저) 조합을 채점한다. pending·failed는 카드 내용과 신입 여부를 몰라, needs_ocr/empty는 jd_text가 비어 제외.
+    2) 재채점 요청: 사용자가 웹에서 요청한(rescore_requested_at) 점수를 요청 순서대로 다시 채점한다. 줄은 그대로 두고
+       값만 덮어쓰므로 notified_at이 유지돼 알림이 다시 나가지 않는다. 오늘 새 추천이 먼저라 신규 다음에 처리한다.
+    둘 다 하루 Gemini 한도 안에서만 하고, 남은 것은 다음 실행에 이어서 한다.
+    프로필이 바뀌어도 기존 점수를 자동으로 다시 채점하지 않는다 — 구 점수로 표시만 된다(2026-10-15 결정).
     유저 쪽 근거는 users.basic_info + experiences(analysis/profile.py) — 둘 다 비어 있으면 그 유저는 건너뛴다.
     company_score는 당분간 비활성화 (analysis/scorer.py 참고).
     """
@@ -615,13 +638,9 @@ def analyze_job() -> None:
                 try:
                     _record_gemini_call(session)
                     result = score_fit(jd_text=job.jd_text or "", profile_text=profiles[user.id])
-                    session.add(JobScore(
-                        job_id=job.id,
-                        user_id=user.id,
-                        fit_score=result["fit_score"],
-                        fit_reasons=result.get("fit_reasons", ""),
-                        fit_detail=result.get("fit_detail"),
-                    ))
+                    row = JobScore(job_id=job.id, user_id=user.id)
+                    _apply_score(row, result, user, datetime.now(timezone.utc))
+                    session.add(row)
                     session.flush()
                     total += 1
                     time.sleep(_GEMINI_SLEEP_SEC)
@@ -633,10 +652,34 @@ def analyze_job() -> None:
                     )
                     failed += 1
 
+        rescored = 0
+        users_by_id = {user.id: user for user in users}
+        requests = (
+            session.query(JobScore)
+            .filter(JobScore.rescore_requested_at.isnot(None), JobScore.user_id.in_(users_by_id))
+            .order_by(JobScore.rescore_requested_at.asc())
+            .all()
+        )
+        for row in requests:
+            if budget_exhausted or _gemini_budget_exhausted(session):
+                logger.warning("[analyze] Gemini 한도 도달 — 재채점 요청 %d건은 다음 실행에 처리", len(requests) - rescored)
+                break
+            user = users_by_id[row.user_id]
+            try:
+                _record_gemini_call(session)
+                result = score_fit(jd_text=row.job.jd_text or "", profile_text=profiles[user.id])
+                _apply_score(row, result, user, datetime.now(timezone.utc))
+                session.flush()
+                rescored += 1
+                time.sleep(_GEMINI_SLEEP_SEC)
+            except Exception:
+                logger.exception("[analyze] 재채점 실패 job_id=%s user_id=%s", row.job_id, row.user_id)
+                failed += 1
+
         session.commit()
         logger.info(
-            "[analyze] 완료 — 신규 %d건, 스킵 %d건, 실패 %d건",
-            total, skipped, failed,
+            "[analyze] 완료 — 신규 %d건, 재채점 %d건, 스킵 %d건, 실패 %d건",
+            total, rescored, skipped, failed,
         )
 
     except Exception:
@@ -649,7 +692,7 @@ def analyze_job() -> None:
 # ── Job 3: Discord 알림 ──────────────────────────────────────────────────
 
 def notify_job() -> None:
-    """09:00 KST — 유저별 상위 3개 공고 Discord DM 발송."""
+    """09:00 KST — 유저별 매칭 채널에 아직 안 보낸 추천 공고 발송 (bot/notifications.py)."""
     logger.info("[notify] 시작")
     try:
         from bot.notifications import send_daily_notifications
@@ -657,3 +700,16 @@ def notify_job() -> None:
         logger.info("[notify] 완료")
     except Exception:
         logger.exception("[notify] 실패")
+
+
+# ── Job 4: 비서 DM ───────────────────────────────────────────────────────
+
+def assistant_job() -> None:
+    """매칭 알림 직후 — 유저별 DM으로 마감 리마인드(매일)와 3일 현황 요약(3일마다) 발송 (bot/assistant.py)."""
+    logger.info("[assistant] 시작")
+    try:
+        from bot.assistant import send_assistant_messages
+        asyncio.run(send_assistant_messages())
+        logger.info("[assistant] 완료")
+    except Exception:
+        logger.exception("[assistant] 실패")

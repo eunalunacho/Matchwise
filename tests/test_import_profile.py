@@ -46,3 +46,14 @@ def test_import_profile_rejects_unknown_user(session):
 
     with pytest.raises(ValueError):
         import_profile(session, 999, _DATA)
+
+
+def test_import_profile_bumps_profile_version_so_old_scores_become_stale(session):
+    user = User(username="u")
+    session.add(user)
+    session.commit()
+    before = user.profile_version
+
+    import_profile(session, user.id, {"basic_info": {"병역": "비대상"}, "experiences": []})
+
+    assert session.get(User, user.id).profile_version == before + 1

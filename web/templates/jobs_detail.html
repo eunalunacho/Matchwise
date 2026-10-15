@@ -7,6 +7,18 @@
 </h2>
 <p><a href="{{ job.url }}" target="_blank">공고 원문 →</a></p>
 
+<div class="card">
+  <h3>📌 지원 상태: {{ status_labels[application.status] if application else '없음' }}</h3>
+  {% for value in ('will_apply', 'submitted', 'assignment', 'interview', 'passed', 'rejected', 'dismissed') %}
+  {% if not application or application.status != value %}
+  <form method="post" action="/jobs/{{ job.id }}/status" style="display:inline;">
+    <input type="hidden" name="status" value="{{ value }}">
+    <button class="btn" type="submit">{{ status_labels[value] }}</button>
+  </form>
+  {% endif %}
+  {% endfor %}
+</div>
+
 {% if summary.tasks %}
 <div class="card">
   <h3>💼 하는 일</h3>
@@ -37,11 +49,18 @@
   <thead><tr><th>적합도</th><th>매칭 이유</th></tr></thead>
   <tbody>
     <tr>
-      <td>{{ score.fit_score }}</td>
+      <td>{{ score.fit_score }}{% if stale %} <span class="tag">구 점수</span>{% endif %}</td>
       <td>{{ score.fit_reasons }}</td>
     </tr>
   </tbody>
 </table>
+{% if score.rescore_requested_at %}
+<p style="color:#6b7280;">재채점 요청됨 — 다음 채점(05시)에 다시 매깁니다.</p>
+{% else %}
+<form method="post" action="/jobs/{{ job.id }}/rescore">
+  <button class="btn" type="submit">재채점 요청</button>
+</form>
+{% endif %}
 {% else %}
 <p style="color:#6b7280;">아직 분석되지 않았습니다.</p>
 {% endif %}

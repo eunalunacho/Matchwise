@@ -10,7 +10,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from db.orm import ApplicationQuestion, Base, Experience, Job, JobScore, ResumeDraft, User
+from db.orm import (
+    Application, ApplicationEvent, ApplicationQuestion, Base, Experience, Job, JobScore, ResumeDraft, User,
+)
 from web.deps import NotAuthenticated, get_current_user, get_db
 from web.main import app
 
@@ -64,7 +66,7 @@ def _clean_db():
     _logout()
     s = TestSession()
     try:
-        for model in (ResumeDraft, ApplicationQuestion, JobScore, Experience, Job, User):
+        for model in (ApplicationEvent, Application, ResumeDraft, ApplicationQuestion, JobScore, Experience, Job, User):
             s.query(model).delete()
         s.commit()
     finally:
@@ -459,3 +461,105 @@ def test_draft_page_does_not_show_other_users_answer():
     assert resp.status_code == 200
     assert "owner만의 답변" not in resp.text
     assert "아직 이 질문에 대한 초안이 없습니다" in resp.text
+
+
+# ── 구 점수·재채점 요청 (2026-10-15) ────────────────────────────────────
+
+def _job_with_score(user_id: int, **score_fields) -> int:
+    from analysis.scorer import SCORER_VERSION
+    s = TestSession()
+    job = Job(source="a", url="https://ex.com/1", title="ML Engineer", company="Acme")
+    s.add(job)
+    s.flush()
+    fields = {"fit_score": 80, "profile_version": 1, "scorer_version": SCORER_VERSION, **score_fields}
+    s.add(JobScore(job_id=job.id, user_id=user_id, **fields))
+    s.commit()
+    job_id = job.id
+    s.close()
+    return job_id
+
+
+def _score(user_id: int) -> JobScore:
+    s = TestSession()
+    try:
+        return s.query(JobScore).filter_by(user_id=user_id).one()
+    finally:
+        s.close()
+
+
+def test_dashboard_marks_stale_scores_and_requests_rescore_for_all_of_them():
+    user_id = _make_user()
+    _job_with_score(user_id, scorer_version=1)
+    _login_as(user_id)
+
+    page = client.get("/dashboard").text
+    assert "구 점수" in page and "구 점수 1건" in page
+
+    resp = client.post("/scores/rescore-stale", follow_redirects=False)
+    assert resp.status_code == 303
+    assert _score(user_id).rescore_requested_at is not None
+    assert "재채점 대기" in client.get("/dashboard").text
+
+
+def test_dashboard_has_no_rescore_banner_when_scores_are_current():
+    user_id = _make_user()
+    _job_with_score(user_id)
+    _login_as(user_id)
+
+    assert "구 점수" not in client.get("/dashboard").text
+
+
+def test_job_detail_rescore_request_for_one_job():
+    user_id = _make_user()
+    job_id = _job_with_score(user_id)
+    _login_as(user_id)
+
+    client.post(f"/jobs/{job_id}/rescore")
+    assert _score(user_id).rescore_requested_at is not None
+    assert "재채점 요청됨" in client.get(f"/jobs/{job_id}").text
+
+
+# ── 지원 상태 변경 (웹 [제출 완료] 등) ──────────────────────────────────
+
+def test_job_detail_status_submit_records_change_with_web_source():
+    user_id = _make_user()
+    job_id = _job_with_score(user_id)
+    _login_as(user_id)
+
+    resp = client.post(f"/jobs/{job_id}/status", data={"status": "submitted"}, follow_redirects=False)
+    assert resp.status_code == 303
+
+    s = TestSession()
+    try:
+        app = s.query(Application).filter_by(job_id=job_id, user_id=user_id).one()
+        assert app.status == "submitted" and app.submitted_at is not None
+        event = s.query(ApplicationEvent).one()
+        assert (event.from_status, event.to_status, event.source) == (None, "submitted", "web")
+    finally:
+        s.close()
+    page = client.get(f"/jobs/{job_id}").text
+    assert "지원 상태: 제출 완료" in page
+
+
+def test_job_detail_status_rejects_unknown_status():
+    user_id = _make_user()
+    job_id = _job_with_score(user_id)
+    _login_as(user_id)
+
+    assert client.post(f"/jobs/{job_id}/status", data={"status": "interested"}).status_code == 400
+
+
+def test_adding_experience_bumps_profile_version():
+    user_id = _make_user()
+    _login_as(user_id)
+    s = TestSession()
+    before = s.get(User, user_id).profile_version
+    s.close()
+
+    client.post("/experiences/add", data={"kind": "project", "content": "RAG 챗봇"})
+
+    s = TestSession()
+    try:
+        assert s.get(User, user_id).profile_version == before + 1
+    finally:
+        s.close()

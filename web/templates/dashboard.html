@@ -12,12 +12,20 @@
 </div>
 {% endif %}
 
+{% if stale_count %}
+<form method="post" action="/scores/rescore-stale" class="card">
+  프로필이나 채점 기준이 바뀌기 전에 매긴 <b>구 점수 {{ stale_count }}건</b>이 있습니다.
+  <button class="btn" type="submit">구 점수 재채점 요청</button>
+  <small style="color:#6b7280;">다음 채점(05시)에 하루 AI 한도 안에서 순서대로 다시 채점합니다.</small>
+</form>
+{% endif %}
+
 <table>
   <thead>
-    <tr><th>회사</th><th>포지션</th><th>출처</th><th>적합도</th><th>기업점수</th><th></th></tr>
+    <tr><th>회사</th><th>포지션</th><th>출처</th><th>적합도</th><th>지원 상태</th><th></th></tr>
   </thead>
   <tbody>
-    {% for job, score in jobs %}
+    {% for job, score, app, stale in jobs %}
     <tr>
       <td>{{ job.company or '-' }}</td>
       <td>{{ job.title or '-' }}</td>
@@ -27,8 +35,10 @@
         {%- elif score and score.fit_score >= 60 %}score-md
         {%- else %}score-lo{%- endif %}">
         {{ score.fit_score if score else '-' }}
+        {%- if score and score.rescore_requested_at %} <span class="tag">재채점 대기</span>
+        {%- elif stale %} <span class="tag">구 점수</span>{% endif %}
       </td>
-      <td>{{ score.company_score if score else '-' }}</td>
+      <td>{{ status_labels[app.status] if app else '-' }}</td>
       <td><a class="btn" href="/jobs/{{ job.id }}">상세</a></td>
     </tr>
     {% else %}

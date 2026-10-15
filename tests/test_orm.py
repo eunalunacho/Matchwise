@@ -32,7 +32,7 @@ def test_job_score_unique_constraint(session):
         session.flush()
 
 
-def test_application_defaults_to_interested_status(session):
+def test_application_defaults_to_saved_status(session):
     user = User(discord_id="222", username="u2")
     job = Job(source="inthiswork", url="https://example.com/job/3", title="Dev", company="Co")
     session.add_all([user, job])
@@ -43,7 +43,7 @@ def test_application_defaults_to_interested_status(session):
     session.commit()
 
     found = session.query(Application).filter_by(job_id=job.id, user_id=user.id).first()
-    assert found.status == "interested"
+    assert found.status == "saved"
     assert found.will_apply_at is None
     assert found.submitted_at is None
 

@@ -1,20 +1,24 @@
-"""Discord 일일 매칭 알림 모듈 — 뉴스레터 성격이라 매칭 채널(DISCORD_MATCH_CHANNEL_ID)로 보낸다.
+"""Discord 일일 매칭 알림 모듈 — 뉴스레터 성격이라 사용자마다 자기 매칭 채널(users.match_channel_id)로 보낸다.
 
 스케줄러의 notify_job()이 asyncio.run(send_daily_notifications())로 호출한다.
 봇 토큰으로 임시 로그인 → 채널 전송 → 로그아웃 방식으로 동작한다. 버튼(목록에 등록·패스)이 있어
-웹훅이 아니라 봇이 보낸다. 지원 현황·리마인드 같은 '비서' 메시지는 DM으로 따로 보낸다(2026-10-15 결정).
+웹훅이 아니라 봇이 보낸다. 지원 현황·리마인드 같은 '비서' 메시지는 DM으로 따로 보낸다(bot/assistant.py).
 
-보내는 대상: 오늘(KST 0시 이후) 채점된 점수 중 MIN_FIT_SCORE 이상 — 어제 이전 점수는 이미 보냈으므로
-같은 공고가 매일 반복되지 않는다. 상위 CARD_COUNT건은 카드로, 나머지는 스레드에 한 줄 링크로 넣는다.
+보내는 대상: 아직 안 보낸(notified_at 비어 있음) 점수 중 MIN_FIT_SCORE 이상이고 지원 상태(등록·패스 등)가 없는 것.
+보낸 뒤 notified_at·notified_as를 기록하므로 재채점해도 같은 공고가 다시 나가지 않는다(2026-10-15).
+상위 CARD_COUNT건은 카드로, 나머지는 스레드에 한 줄 링크로 넣는다.
 """
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 import discord
 
-from db.orm import Job, JobScore, User
+from sqlalchemy import exists
+
+from db.orm import Application, Job, JobScore, User
 from shared.config import get_settings
 from shared.db import get_session
+from tracker.lists import kst_date
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +74,7 @@ def format_job_message(
 
     desc_parts = [f"매칭 **{fit}점**"]
     if job.deadline:
-        delta = (job.deadline.date() - date.today()).days
+        delta = (kst_date(job.deadline) - kst_date(datetime.now(timezone.utc))).days
         desc_parts.append(f"마감 D-{delta}" if delta >= 0 else "마감 지남")
     embed.description = " · ".join(desc_parts)
 
@@ -114,7 +118,7 @@ def format_more_line(score: JobScore) -> str:
     return f"• [{name}]({job.url}) · {score.fit_score}점"
 
 
-def _chunk_lines(lines: list[str], limit: int = _DISCORD_CONTENT_LIMIT) -> list[str]:
+def chunk_lines(lines: list[str], limit: int = _DISCORD_CONTENT_LIMIT) -> list[str]:
     """줄 목록을 Discord 메시지 길이 제한 안의 덩어리로 나눈다."""
     chunks: list[str] = []
     current = ""
@@ -130,21 +134,18 @@ def _chunk_lines(lines: list[str], limit: int = _DISCORD_CONTENT_LIMIT) -> list[
     return chunks
 
 
-def _today_start_utc(now: datetime) -> datetime:
-    """오늘 0시(KST)를 UTC로."""
-    kst_midnight = now.astimezone(_KST).replace(hour=0, minute=0, second=0, microsecond=0)
-    return kst_midnight.astimezone(timezone.utc)
-
-
-def _todays_scores(session, user_id: int, since: datetime) -> list[JobScore]:
-    """오늘 채점된 추천 대상 점수 — fit_score 우선, 점수가 비슷한(10점 단위) 것끼리는 마감 가까운 순."""
+def _unsent_scores(session, user_id: int) -> list[JobScore]:
+    """아직 안 보낸 추천 대상 점수 — fit_score 우선, 점수가 비슷한(10점 단위) 것끼리는 마감 가까운 순."""
+    has_application = exists().where(
+        Application.job_id == JobScore.job_id, Application.user_id == JobScore.user_id,
+    )
     return (
         session.query(JobScore)
         .join(Job)
         .filter(JobScore.user_id == user_id)
         .filter(JobScore.fit_score >= MIN_FIT_SCORE)
-        .filter(JobScore.dismissed.is_(False))
-        .filter(JobScore.scored_at >= since)
+        .filter(JobScore.notified_at.is_(None))
+        .filter(~has_application)
         .order_by(
             # SQLAlchemy의 `/`는 실수 나눗셈으로 강제 변환되어(예: 91/10=9.1) 타이어링이
             # 깨지므로, .op("/")로 SQLite의 정수 나눗셈(91/10=9)을 그대로 쓴다.
@@ -160,7 +161,7 @@ async def _post_recommendations(channel, scores: list[JobScore], day: datetime) 
     """헤더 → 상위 카드 → (나머지가 있으면) 스레드에 한 줄 링크 목록."""
     label = f"{day.month}월 {day.day}일"
     if not scores:
-        await channel.send(content=f"📭 {label} — 오늘 새로 채점된 추천 공고 없음")
+        await channel.send(content=f"📭 {label} — 새 추천 공고 없음")
         return
 
     await channel.send(content=f"📬 {label} 추천 공고 — {len(scores)}건")
@@ -173,36 +174,51 @@ async def _post_recommendations(channel, scores: list[JobScore], day: datetime) 
         return
     anchor = await channel.send(content=f"➕ 나머지 {len(rest)}건 보기")
     thread = await anchor.create_thread(name=f"{label} 나머지 추천 {len(rest)}건"[:_THREAD_NAME_LIMIT])
-    for chunk in _chunk_lines([format_more_line(s) for s in rest]):
+    for chunk in chunk_lines([format_more_line(s) for s in rest]):
         await thread.send(content=chunk, suppress_embeds=True)
 
 
+def _mark_sent(scores: list[JobScore], now: datetime) -> None:
+    """보낸 점수에 시각과 방식(카드/스레드)을 남긴다."""
+    for index, score in enumerate(scores):
+        score.notified_at = now
+        score.notified_as = "card" if index < CARD_COUNT else "thread"
+
+
 async def send_daily_notifications() -> None:
-    """활성 유저별 오늘 채점된 추천 공고를 매칭 채널로 보낸다. 채널 ID가 없으면 로그인하지 않고 끝낸다."""
-    settings = get_settings()
-    channel_id = settings.discord.match_channel_id
-    if not channel_id:
-        logger.warning("[notify] DISCORD_MATCH_CHANNEL_ID 미설정 — 매칭 알림 생략")
-        return
+    """활성 유저마다 자기 매칭 채널로 아직 안 보낸 추천 공고를 보낸다.
 
-    client = discord.Client(intents=discord.Intents.default())
-    await client.login(settings.discord.bot_token.get_secret_value())
-
+    채널(users.match_channel_id)이 없는 유저는 건너뛴다 — 공유 채널로 보내면 남의 점수가 보이므로 기본 채널을 두지 않는다.
+    보낼 유저가 하나도 없으면 로그인하지 않고 끝낸다. 한 유저의 전송 실패는 그 유저만 되돌리고(다음 날 다시 보냄) 넘어간다.
+    """
     session = get_session()
+    client = None
     try:
-        channel = await client.fetch_channel(channel_id)
-        now = datetime.now(timezone.utc)
-        since = _today_start_utc(now)
         users = session.query(User).filter_by(is_active=True).all()
-
+        targets = [user for user in users if user.match_channel_id]
         for user in users:
+            if not user.match_channel_id:
+                logger.warning("[notify] user_id=%s 매칭 채널 미설정 — 건너뜀 (users.match_channel_id)", user.id)
+        if not targets:
+            return
+
+        client = discord.Client(intents=discord.Intents.default())
+        await client.login(get_settings().discord.bot_token.get_secret_value())
+        now = datetime.now(timezone.utc)
+
+        for user in targets:
             try:
-                scores = _todays_scores(session, user.id, since)
+                channel = await client.fetch_channel(int(user.match_channel_id))
+                scores = _unsent_scores(session, user.id)
                 await _post_recommendations(channel, scores, now.astimezone(_KST))
+                _mark_sent(scores, now)
+                session.commit()
                 logger.info("[notify] user_id=%s 추천 %d건 전송", user.id, len(scores))
             except Exception:
+                session.rollback()
                 logger.exception("[notify] user_id=%s 채널 전송 실패", user.id)
 
     finally:
         session.close()
-        await client.close()
+        if client is not None:
+            await client.close()

@@ -27,10 +27,10 @@ v3는 **v1의 기능 명세를 v2의 인프라 위에 되살린다.** v1과 v2�
 | # | 요구 | 담당 레이어 | 현재 상태 |
 |---|---|---|---|
 | ① | 쓸 만한 공고 자동 수집 | Layer 1 | ✅ 인디스워크·자소설·잡코리아 수집 + 추출·OCR (docs/superpowers/specs 참고). 청킹(`job_chunks`)은 미착수 |
-| ② | 나에게 맞는 순서로 추천 | Layer 1 | 🟡 매칭 채널에 오늘 채점된 공고 상위 3개 카드 + 나머지 스레드 + `/dashboard` 전체 점수순 목록. 신규공고 페이지(B3)는 미구현 |
+| ② | 나에게 맞는 순서로 추천 | Layer 1 | 🟡 사용자별 매칭 채널에 아직 안 보낸 공고 상위 3개 카드 + 나머지 스레드 + `/dashboard` 전체 점수순 목록(구 점수 표시·재채점 요청). 신규공고 페이지(B3)는 미구현 |
 | ③ | "쓰겠다" 하면 내 기록 기반 초안 작성 | Layer 3 (Draft Agent) | 🟡 설계만 (LangGraph 미구현) |
-| ④ | "제출했다" 하면 일정 저장·리마인드 | Layer 2 | 🟡 상태 저장은 됨(B1), 리마인드는 미구현(C2) |
-| ⑤ | 쓰겠다 하고 안 쓰면 재촉 | Layer 2 | 🟡 상태 추적은 됨(B1), 채널 알림은 미구현(C1/C2) |
+| ④ | "제출했다" 하면 일정 저장·리마인드 | Layer 2 | ✅ 웹 [제출 완료]·DM [제출함] 버튼, 마감 D-7/D-2 DM 리마인드(C2) |
+| ⑤ | 쓰겠다 하고 안 쓰면 재촉 | Layer 2 | ✅ 3일 현황 요약 DM(C1)·마감일 없는 공고는 등록 7일째 리마인드 |
 | ⑥ | 위키처럼 이력을 쓰면 전용 기억저장소 구축 | Layer 3 (Memory Agent) | ❌ 텍스트 blob 2개뿐 |
 | ⑦ | 외부 서비스(GitHub 등) 업데이트 추적 → 기억저장소 갱신 | Layer 3 (Memory Agent) | ❌ 없음 |
 | ⑧ | 형태 잡히면 친구들도 쓰는 서비스로 | 전체 | 🟡 구글 로그인 + Discord 연결 완료. 유저당 분석 상한 없음(전체 공유 상한만) |
@@ -58,12 +58,15 @@ AWS EC2 t2.micro — Docker Compose
 │      05:00 → analysis  (Gemini Flash: fit_score. 추출 완료(ok) + 신입 가능/모름 + 서울·과천·판교·분당/미기재만.
 │                         extract_job과 하루 Gemini 호출 상한 400건 공유
 │                         / DART company_score는 비활성화)
-│      09:00 → bot 알림  (discord.py: 매칭 채널에 오늘 채점분 상위 3개 + 스레드)
+│      09:00 → bot 알림  (discord.py: 사용자별 매칭 채널에 안 보낸 추천 상위 3개 + 스레드)
+│      09:10 → 비서 DM   (마감 리마인드 매일 · 현황 요약 3일마다)
 │    요구 ①② 담당
 │
 ├─ Layer 2. 지원 관리  (v1 Application Manager 개념을 새 인프라로)
-│    applications 테이블 (상태머신) + Discord 버튼 [자세히 보기][목록에 등록][패스] (5-2)
-│    scheduler 잡(미구현): 채널 3일 현황 공유(5-3), 마감 D-7/D-2 리마인드(5-4) — LLM 불필요
+│    tracker/  applications(현재 상태) + application_events(변경 기록), change_status 한 곳에서 변경
+│              lists — 작성 중/미작성/마감 리마인드/놓친 추천/최근 변화 조회 (웹·DM 공용)
+│    Discord 버튼 [자세히 보기][목록에 등록][패스] (5-2), 리마인드 DM [제출함]
+│    bot/assistant.py: DM 3일 현황 요약(5-3), 마감 D-7/D-2 리마인드(5-4) — LLM 불필요
 │    요구 ④⑤ 담당
 │
 ├─ Layer 3. 에이전트  (LangGraph — 포트폴리오 코어)
@@ -83,10 +86,12 @@ AWS EC2 t2.micro — Docker Compose
 
 v2의 일일 플로우를 유지하되, 수집 단계는 [JD 저장 설계](docs/superpowers/specs/2026-09-24-jd-storage-design.md)대로 원본(`raw_postings`) → 정리(`jobs`) 계층으로 바뀌었다. 코드는 `crawler/`, `analysis/`, `scheduler/`, `bot/`, `db/orm.py`.
 
-- **수집·추출(02:00, `run_crawl_pipeline`)**: `crawl_job`이 신규 공고를 URL 기준 중복 제거 후 `raw_postings`(원본 그대로)와 `jobs`(`extract_status` 자동 분류)에 저장하고 사이트별 결과를 로그 파일(`logs/<프로그램>.log`, 최근 7일 보관)에 기록 → 이어서 `extract_job`이 JD 요약(`jd_*`)·`eligibility`·근무지(`work_locations`)를 채우고 이미지 JD는 OCR. 실패(`failed`·`needs_ocr`)는 수집한 날 + 다음 날까지만 재시도. 진행 상황(시작·수집 완료·추출 완료·에러)은 Discord 비공개 채널 웹훅으로 전송
+- **수집·추출(02:00, `run_crawl_pipeline`)**: `crawl_job`이 신규 공고를 URL 기준 중복 제거 후 `raw_postings`(원본 그대로)와 `jobs`(`extract_status` 자동 분류)에 저장하고 사이트별 결과를 로그 파일(`logs/<프로그램>.log`, 최근 7일 보관)에 기록 → 이어서 `extract_job`이 JD 요약(`jd_*`)·`eligibility`·근무지(`work_locations`)를 채우고 이미지 JD는 OCR. 크롤러가 마감일을 못 준 공고(인디스워크)는 요약·OCR 본문에 적힌 서류 마감일로 `deadline`을 채운다(2026-10-15, 기존 공고는 `scripts/backfill_deadlines.py`). 실패(`failed`·`needs_ocr`)는 수집한 날 + 다음 날까지만 재시도. 진행 상황(시작·수집 완료·추출 완료·에러)은 Discord 비공개 채널 웹훅으로 전송
 - **분석(05:00)**: 채점 대상은 `extract_status='ok'`이고 아직 점수가 없는 (공고 × 활성 유저) 조합 중, 하는 일(`jd_tasks`)이 비어 있지 않고, 신입 불가(`eligibility.new_grad_ok=false`)가 아니고 근무지(`work_locations`)가 서울·과천·판교·분당 중 하나이거나 미기재인 공고(2026-10-14 결정 — 정보가 없으면 채점, 명시적으로 안 맞는 것만 제외). 조합마다 Gemini Flash가 직무 선택·관문(학력·경력·필수 어학/자격·전공)·항목 점수(직무 방향 30·필수 스택 15·업무 경험 20·우대 20·근거 강도 10·도메인 5)를 매기면 코드가 총점(`fit_score`, 우대사항 없으면 100점 환산, 관문 fail이면 30점 상한)을 계산해 `fit_reasons`·`fit_detail`(JSON)과 함께 저장(2026-10-14). 답을 해석 못 하면 저장하지 않고 다음 실행에 재시도. 근거는 `users.basic_info` + `experiences`를 `analysis/profile.py::build_profile_text()`로 펼친 프로필 텍스트(2026-10-14 전환, 둘 다 비어 있는 유저는 채점 건너뜀). `company_score`는 비활성화(DART/LLM 계산 함수만 보존). 하루 호출 상한 400건을 `extract_job`과 공유(`gemini_usage` 테이블)
-- **알림(09:00)**: 매칭 채널(`DISCORD_MATCH_CHANNEL_ID`)에 오늘(KST 0시 이후) 채점된 공고만 — 어제 이전 점수는 이미 보냈으므로 매일 같은 공고가 반복되지 않는다. 상위 3개는 카드(제목 `[회사] 직무명 (고용형태)`, 본문 하는 일 + 왜 나랑 맞나, 3버튼 5-2), 나머지는 스레드에 `회사 — 직무 · 점수` 한 줄 링크. fit_score 50점 미만·패스한 공고 제외 (2026-10-15)
-- **정리(01:00, `cleanup_job`)**: 마감 지난 `jobs`와 점수·질문·초안 삭제. `applications`가 있는 공고와 `raw_postings`는 보존
+- **채점 버전과 재채점(2026-10-15)**: 점수마다 채점에 쓴 `profile_version`(프로필을 고칠 때마다 +1)과 `scorer_version`(`analysis/scorer.py::SCORER_VERSION`, 채점 규칙을 바꾸면 +1)을 남긴다. 둘 중 하나라도 지금 값과 다르면 **구 점수**로 표시만 하고 자동으로 다시 채점하지 않는다. 사용자가 웹(`/dashboard`의 [구 점수 재채점 요청], 공고 상세의 [재채점 요청])에서 요청하면 `rescore_requested_at`이 찍히고, 다음 `analyze_job`이 신규 채점 뒤에 하루 한도 안에서 줄을 지우지 않고 값만 덮어쓴다. 새로 들어오는 공고는 바뀐 프로필로 채점된다
+- **알림(09:00)**: 사용자마다 자기 매칭 채널(`users` 테이블의 `match_channel_id` 칸 — 사용자가 그 채널에서 슬래시 명령어 `/매칭채널`로 직접 정한다, `bot/commands.py`. 없으면 그 사용자는 건너뜀 — 공유 채널은 남의 점수가 보여 두지 않는다)에 **아직 안 보낸**(`job_scores.notified_at` 비어 있음) 점수만 보내고, 보낸 뒤 `notified_at`·`notified_as`(card/thread)를 기록한다. 재채점해도 다시 나가지 않는다(2026-10-15, 이전의 "오늘 채점된 것" 기준을 대체). 상위 3개는 카드(제목 `[회사] 직무명 (고용형태)`, 본문 하는 일 + 왜 나랑 맞나, 3버튼 5-2), 나머지는 스레드에 `회사 — 직무 · 점수` 한 줄 링크. fit_score 50점 미만·지원 상태(등록·패스 등)가 있는 공고 제외 (2026-10-15)
+- **정리(01:00, `cleanup_job`)**: 마감 지난 `jobs`와 점수·질문·초안 삭제. 패스 외의 `applications`가 있는 공고와 `raw_postings`는 보존(패스만 있는 공고는 그 기록과 함께 삭제)
+- **시각 저장 규칙(2026-10-15)**: 모든 시각 칸은 `db/orm.py::UTCDateTime` — UTC로 저장하고 UTC로 읽는다. SQLite가 시간대를 버려 KST 마감일과 UTC 기록 시각이 섞이던 문제를 고쳤다(기존 마감일은 `scripts/migrate_tracking.py`가 -9시간 보정). D-day·7일째 계산은 한국 날짜 기준(`tracker/lists.py::kst_date`)
 
 ---
 
@@ -94,22 +99,37 @@ v2의 일일 플로우를 유지하되, 수집 단계는 [JD 저장 설계](docs
 
 > 2026-08-11 구체화(v3.1). 아래 5-2~5-8은 실사용 요구를 반영해 처음보다 구체적으로 확정한 내용이며, 일부는 판단이 필요해 **[결정]** 태그로 명시하고 11절 미결 사항에도 정리했다.
 
-### 5-1. applications 테이블 (구현됨)
+### 5-1. applications + application_events (구현됨, 2026-10-15 개편)
+
+**2026-10-15 결정 — 2명이 쓰지만 2~100명이 붙어도 되는 구조**: 사용자 × 공고의 상태는 현재 상태(`applications`)와 변경 기록(`application_events`)으로 나눈다. 패스(관심 없음)도 사용자 행동이라 점수(`job_scores.dismissed`, 삭제됨)가 아니라 여기 `dismissed`로 둔다. 상태는 `tracker/applications.py::change_status`로만 바꾼다 — 현재 상태를 고치고 기록을 한 줄 추가하는 일을 한 번에 한다(Discord 버튼·웹 모두).
 
 ```sql
-CREATE TABLE applications (
+CREATE TABLE applications (              -- (공고, 사용자) 한 쌍에 한 줄, 상태가 바뀌면 고쳐 씀
     id            SERIAL PRIMARY KEY,
     job_id        INTEGER REFERENCES jobs(id),
     user_id       INTEGER REFERENCES users(id),
-    status        VARCHAR(32) NOT NULL DEFAULT 'interested',
-    -- interested | will_apply | submitted | rejected | passed
-    will_apply_at TIMESTAMPTZ,
+    status        VARCHAR(32) NOT NULL DEFAULT 'saved',
+    -- saved(관심) | will_apply(지원 예정) | submitted(제출) | assignment(과제) | interview(면접)
+    -- | passed | rejected | dismissed(패스)
+    will_apply_at TIMESTAMPTZ,           -- 마감일 없는 공고의 "등록 7일째" 리마인드 기준
     submitted_at  TIMESTAMPTZ,
-    interview_at  TIMESTAMPTZ,        -- 사용자가 직접 입력
+    interview_at  TIMESTAMPTZ,           -- 사용자가 직접 입력
     created_at    TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE (job_id, user_id)
-);
+);  -- INDEX (user_id, status)
+
+CREATE TABLE application_events (        -- 바뀔 때마다 한 줄 추가, 고치거나 지우지 않음
+    id             SERIAL PRIMARY KEY,
+    application_id INTEGER REFERENCES applications(id),
+    user_id        INTEGER REFERENCES users(id),
+    from_status    VARCHAR(32),          -- 처음 만들어질 때 NULL
+    to_status      VARCHAR(32) NOT NULL,
+    source         VARCHAR(16) NOT NULL, -- discord | web | system
+    created_at     TIMESTAMPTZ
+);  -- INDEX (user_id, created_at)
 ```
+
+예: A가 10/15 애경을 [목록에 등록] → 10/20 웹에서 [제출 완료]하면 `applications`는 1줄(`submitted`), `application_events`는 2줄(`NULL→will_apply`, `will_apply→submitted`). 목록(작성 중·미작성·리마인드·놓친 추천)은 저장하지 않고 `tracker/lists.py`가 조건으로 만든다.
 
 ### 5-2. Discord 매칭 채널 — 일일 추천 카드 (버튼 3종으로 축소)
 
@@ -121,29 +141,35 @@ CREATE TABLE applications (
 |---|---|---|
 | 자세히 보기 | 링크 버튼 (`style=link`, `url=job.url`) | 스크랩한 원본 공고로 바로 이동. Discord 인터랙션 자체가 안 뜸 — DB 왕복 없음 |
 | 목록에 등록 | 일반 버튼 | `applications.status='will_apply'` 즉시 기록(가벼운 상태 마킹) + ephemeral 응답으로 웹 작성 페이지 링크(`/jobs/{id}/apply`) 안내 |
-| 패스 | 일반 버튼 | 기존 `dismissed` 마킹과 동일 — 이후 추천에서 완전 제외 |
+| 패스 | 일반 버튼 | `applications.status='dismissed'` — 이후 추천에서 완전 제외 (2026-10-15 점수 테이블에서 이동) |
 
 **[결정]** "목록에 등록"은 상태만 즉시 DB에 쓰고(가벼운 북마크), 자소서 같은 실제 콘텐츠 작성·저장은 전부 웹에서만 일어난다 — "클릭 즉시 DB 반영 금지" 원칙은 콘텐츠에 대해서만 적용, 상태 마킹에는 적용하지 않는 걸로 해석했다.
 
 ### 5-3. Discord DM — 3일 주기 현황 공유
 
-3일마다 **DM**으로 현황 요약을 보낸다 (`IntervalTrigger(days=3)`, 2026-10-15 채널→DM).
+3일마다 **DM**으로 현황 요약을 보낸다 (2026-10-15 채널→DM). 구현: `bot/assistant.py` — 매일 09:10 잡이 돌고 한국 날짜 번호가 3의 배수인 날만 보낸다(`IntervalTrigger`는 스케줄러를 다시 켜면 주기가 밀려서 쓰지 않음). 보여줄 게 없으면 보내지 않는다. 작성 중·미작성은 상태가 아니라 `will_apply`를 초안 유무로 나눈 목록이라, 초안 기능(B5) 전까지는 작성 중이 비어 있을 뿐 둘 다 유지한다.
 
 | 섹션 | 조건 | 최대 |
 |---|---|---|
 | 작성 중 | `status='will_apply'` AND 해당 job에 `resume_drafts` 1건 이상 존재 | 3건 |
 | 미작성 | `status='will_apply'` AND `resume_drafts` 0건 | 3건 |
-| 놓치고 있는 추천 | `application` 레코드 없음(= "목록에 등록" 안 누름) AND `fit_score >= 50` | 3건 |
+| 놓치고 있는 추천 | 카드로 보낸 지(`notified_as='card'`) 3일 이상 지남 AND `application` 레코드 없음(등록·패스 둘 다 안 누름) AND `fit_score >= 50` AND 마감 전 (2026-10-15 구체화) | 3건 |
+| 최근 3일 변화 | `application_events` 중 3일 이내, 패스 제외 | 전부 |
 
-DM 대상은 `users.discord_id` — 로컬 DB의 유저 1은 아직 비어 있어 이 기능 착수 시 채워야 한다.
+DM 대상은 `users.discord_id`(없는 유저는 건너뜀).
 
 ### 5-4. Discord DM — 마감 리마인드 (D-7 / D-2)
 
 | 조건 | 동작 |
 |---|---|
-| `status='will_apply' AND submitted_at IS NULL AND deadline` D-7 또는 D-2 | DM으로 "마감 D-N, 아직 제출 전이에요" 전송 |
+| `status='will_apply' AND deadline` 한국 날짜로 D-7 또는 D-2 | DM으로 "마감 D-N — 아직 제출 전이에요" 카드 + [자세히 보기][제출함] |
+| `status='will_apply' AND deadline IS NULL` 등록(`will_apply_at`) 후 7일째 | 같은 카드, "등록 7일째 (마감일 미확인)" |
 
 **[결정]** 기존 설계(D-3/D-1, DM)를 **D-7/D-2**로 교체한다. 위치는 2026-08 "채널+태그"에서 2026-10-15 **DM**으로 다시 바꿨다(5-2 뉴스레터/비서 분리).
+
+**[결정 2026-10-15] 제출 완료 표시는 두 곳**: 웹 공고 페이지의 [제출 완료] 버튼 + 리마인드 DM의 [제출함] 버튼. 둘 다 같은 상태 변경 함수로 `status='submitted'`를 기록한다.
+
+**[결정 2026-10-15] 마감일 없는 공고**: 인디스워크는 목록에 마감일이 없다. 확인 결과 ① 본문(jd_text)에 "2026.10.12 ~ 2026.10.25"처럼 적힌 경우가 31건 중 6건 이상, ② 원본 채용 페이지(`apply_url`)는 사이트마다 달라 나인하이어처럼 마감일 필드가 있는 곳도 있고 recruiter.co.kr·노션처럼 HTTP로는 내용이 안 오는 곳도 있다. → 추출 단계에서 본문의 마감일을 함께 뽑고, 그래도 없으면 등록 후 7일째 한 번 리마인드한다. 원본 페이지 파싱은 자주 나오는 채용 사이트부터 나중에 검토.
 
 ### 5-5. 웹 — 메인 페이지
 
@@ -330,13 +356,13 @@ save_drafts            resume_drafts 저장 → Discord로 웹 링크 DM
 | Phase | 내용 | 요구 | 상태 | 의존성 |
 |---|---|---|---|---|
 | **A** | Layer 1 완성 — 봇 버튼 인터랙션, web-api 대시보드 | ①② | ✅ 완료 (JD 저장 계층 1·2차까지. 3차 `job_chunks`는 스펙 문서에서 관리) | — |
-| **B1** | `applications` 테이블 | ④⑤ 토대 | ✅ 구현됨 | A |
+| **B1** | `applications` 테이블 | ④⑤ 토대 | ✅ 구현됨 (2026-10-15 `application_events`·`change_status`·패스 이동) | A |
 | **B2** | Discord DM 3버튼(자세히보기/목록등록/패스)으로 재정리 (5-2) | ④⑤ | ✅ 완료 — 단 "목록에 등록" 응답의 링크 `/jobs/{id}/apply`는 B5 전까지 404 | B1 |
 | **B3** | 웹: 메인/신규공고/작성중공고 페이지 (5-5, 5-6, 5-7 목록부) | ②④ | ❌ 없음 | B1 |
 | **B4** | 경험 조각 저장 페이지 (5-8, pgvector 없음) | ③ 토대 | ✅ 완료 (`/experiences`) | — (독립) |
 | **B5** | 작성 페이지 + LLM 자동 초안 생성 (5-7 작성부) | ③ | ❌ 없음 (지금은 `/jobs/{id}` 질문 등록 + `/draft/{id}` 조회만, 초안을 만드는 코드 없음) | B3, B4 |
-| **C1** | 채널 3일 현황 공유 (5-3) | ④⑤ | ❌ 없음, `DISCORD_CHANNEL_ID` 설정 필요 | B1 |
-| **C2** | 마감 리마인드 D-7/D-2, DM (5-4) | ④⑤ | ❌ 없음 (D-3/D-1·DM 버전은 폐기) | B1 |
+| **C1** | DM 3일 현황 공유 (5-3) | ④⑤ | ✅ 2026-10-15 (`bot/assistant.py`) | B1 |
+| **C2** | 마감 리마인드 D-7/D-2, DM (5-4) | ④⑤ | ✅ 2026-10-15 — [제출함] 버튼, 마감일 없으면 등록 7일째 | B1 |
 | **D** | pgvector로 `experiences` 확장 (6-1) | ⑥ | 보류 — B4 데이터 많아지면 착수 | B4 |
 | **E** | Draft Agent를 LangGraph StateGraph로 고도화 (6-3) | ③ | 보류 — B5(직접 LLM 호출)로 우선 충분 | D |
 | **F** | GitHub 동기화 (Memory Agent `sync_github`) | ⑦ | ❌ 없음 | D |
@@ -372,6 +398,8 @@ B4는 다른 B*와 독립적으로 바로 시작 가능. C1/C2는 B1만 있으�
 8. **(신규) 초안 자동 생성 트리거**: 질문마다 개별 [초안 생성] 버튼인지, 페이지 진입 시 전체 질문 일괄 생성인지 미정
 9. **(2026-10-14) 서버 배포·멀티유저 방식 보류**: 우선 내 PC에서만 돌린다. 친구들이 AI 툴을 주로 쓰므로 웹페이지를 계속 만들지, 다른 형태로 제공할지 기능 완성 후 재논의. 그때 Google API 인증도 함께 결정 — 후보: 로컬은 ADC 파일 마운트, EC2면 Workload Identity Federation(키 없음), GCP로 옮기면 VM에 서비스 계정 부착. 서비스 계정 키 파일은 비추천
 10. **(2026-10-15, 이후 할 일) 사이트 간 중복 공고 제거**: 같은 공고가 여러 사이트에서 따로 수집돼 두 번 채점·추천된다(예: 애경 AK아이에스 2027 신입 공채 — 인디스워크 84점·잡코리아 82점). 지금 중복 기준은 사이트 안의 URL뿐이다. 후보: `apply_url`(기업 채용 페이지) 정규화 일치, 또는 회사명+제목 유사도. 알림 단계에서 같은 회사·같은 직무를 하나로 묶는 것부터 검토
+11. **(2026-10-15, MVP 이후 할 일) 채점 전 사전 필터**: 사용자가 늘면 `신규 공고 수 × 사용자 수`만큼 Gemini를 부른다(하루 150건 × 5명 = 750회 > 하루 한도 400). 희망직무 키워드·직군 분류처럼 AI를 쓰지 않는 규칙으로 그 사용자 분야의 공고만 채점 대상으로 넘긴다
+12. **(2026-10-15, 전체 구조를 잡은 뒤 할 일) 사용자별 크롤러 검색 조건**: 분야가 다른 사용자의 공고가 수집되려면 사이트별 검색 조건(직군·키워드)을 사용자 희망직무에서 모아 만들어야 한다. 지금 크롤러 조건은 한 벌이다
 
 ---
 

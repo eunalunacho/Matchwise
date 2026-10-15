@@ -1408,3 +1408,130 @@ def test_cleanup_job_keeps_future_deadline(session):
         cleanup_job()
 
     assert session.query(Job).filter_by(id=job_id).first() is not None
+
+
+# ── 채점 버전·재채점 요청 (2026-10-15) ───────────────────────────────────
+
+def _scored_pair(session, **score_fields):
+    user = User(discord_id="1", username="u", is_active=True, basic_info=_PROFILE, profile_version=3)
+    job = Job(source="a", url="https://a.com/1", title="t", company="c", jd_text="본문", extract_status="ok", jd_tasks=["업무"])
+    session.add_all([user, job])
+    session.flush()
+    row = None
+    if score_fields:
+        row = JobScore(job_id=job.id, user_id=user.id, **score_fields)
+        session.add(row)
+    session.commit()
+    return user, job, row
+
+
+_RESULT = {"fit_score": 77, "fit_reasons": "새 이유", "fit_detail": {"position": "새 직무"}}
+
+
+def test_analyze_job_stamps_profile_and_scorer_version_on_new_scores(session):
+    from analysis.scorer import SCORER_VERSION
+    _scored_pair(session)
+    with patch("scheduler.jobs.get_session", return_value=session), \
+         patch("scheduler.jobs.score_fit", return_value=_RESULT), \
+         patch("scheduler.jobs.time.sleep"):
+        analyze_job()
+
+    saved = session.query(JobScore).one()
+    assert (saved.profile_version, saved.scorer_version) == (3, SCORER_VERSION)
+    assert saved.notified_at is None
+
+
+def test_analyze_job_does_not_rescore_stale_scores_without_request(session):
+    """프로필이 바뀌어 구 점수가 돼도 자동으로 다시 채점하지 않는다."""
+    _scored_pair(session, fit_score=50, profile_version=1, scorer_version=1)
+    with patch("scheduler.jobs.get_session", return_value=session), \
+         patch("scheduler.jobs.score_fit") as mock_score:
+        analyze_job()
+
+    mock_score.assert_not_called()
+
+
+def test_analyze_job_rescores_requested_scores_in_place_and_keeps_notified_at(session):
+    from analysis.scorer import SCORER_VERSION
+    sent_at = datetime(2026, 10, 15, 0, 0, tzinfo=timezone.utc)
+    _, _, row = _scored_pair(
+        session, fit_score=50, fit_reasons="옛 이유", profile_version=1, scorer_version=1,
+        notified_at=sent_at, notified_as="card", rescore_requested_at=datetime(2026, 10, 15, 3, 0),
+    )
+    row_id = row.id
+    with patch("scheduler.jobs.get_session", return_value=session), \
+         patch("scheduler.jobs.score_fit", return_value=_RESULT) as mock_score, \
+         patch("scheduler.jobs.time.sleep"):
+        analyze_job()
+
+    mock_score.assert_called_once()
+    saved = session.query(JobScore).one()
+    assert saved.id == row_id  # 지우지 않고 덮어씀
+    assert (saved.fit_score, saved.fit_reasons) == (77, "새 이유")
+    assert (saved.profile_version, saved.scorer_version) == (3, SCORER_VERSION)
+    assert saved.rescore_requested_at is None
+    assert saved.notified_at == sent_at  # 알림이 다시 나가지 않게 유지
+
+
+def test_analyze_job_leaves_rescore_requests_when_budget_exhausted(session):
+    _scored_pair(session, fit_score=50, rescore_requested_at=datetime(2026, 10, 15, 3, 0))
+    session.add(GeminiUsage(usage_date=date.today(), call_count=_GEMINI_DAILY_CAP))
+    session.commit()
+    with patch("scheduler.jobs.get_session", return_value=session), \
+         patch("scheduler.jobs.score_fit") as mock_score:
+        analyze_job()
+
+    mock_score.assert_not_called()
+    assert session.query(JobScore).one().rescore_requested_at is not None
+
+
+# ── 본문에서 마감일 채우기 (인디스워크) ──────────────────────────────────
+
+def _pending(session, deadline=None):
+    session.add(Job(source="inthiswork", url="https://a.com/d", title="t", company="c",
+                    jd_text="서류접수 ~ 10월 28일 23:59", extract_status="pending", deadline=deadline))
+    session.commit()
+
+
+def test_extract_job_fills_missing_deadline_from_summary(session):
+    _pending(session)
+    found = datetime(2026, 10, 28, 14, 59, tzinfo=timezone.utc)
+    with patch("scheduler.jobs.get_session", return_value=session), \
+         patch("scheduler.jobs.summarize_jd", return_value={**_TASK_SUMMARY, "deadline": found}), \
+         patch("scheduler.jobs.time.sleep"):
+        extract_job()
+
+    assert session.query(Job).one().deadline == found
+
+
+def test_extract_job_keeps_crawler_deadline(session):
+    crawler_deadline = datetime(2026, 11, 1, 23, 59, tzinfo=_KST)
+    _pending(session, deadline=crawler_deadline)
+    with patch("scheduler.jobs.get_session", return_value=session), \
+         patch("scheduler.jobs.summarize_jd",
+               return_value={**_TASK_SUMMARY, "deadline": datetime(2026, 10, 28, tzinfo=timezone.utc)}), \
+         patch("scheduler.jobs.time.sleep"):
+        extract_job()
+
+    assert session.query(Job).one().deadline == crawler_deadline
+
+
+# ── cleanup: 패스만 있는 공고 ───────────────────────────────────────────
+
+def test_cleanup_job_deletes_expired_job_with_only_a_pass_and_its_records(session):
+    from db.orm import ApplicationEvent
+    from tracker.applications import change_status
+    user = User(discord_id="3", username="u3")
+    expired = Job(source="a", url="https://example.com/passed", title="P", company="C",
+                  deadline=datetime.now(timezone.utc) - timedelta(days=1))
+    session.add_all([user, expired])
+    session.flush()
+    change_status(session, user.id, expired.id, "dismissed", source="discord")
+    session.commit()
+
+    with patch("scheduler.jobs.get_session", return_value=session):
+        cleanup_job()
+
+    assert session.query(Job).count() == 0
+    assert session.query(Application).count() == 0
+    assert session.query(ApplicationEvent).count() == 0

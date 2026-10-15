@@ -8,6 +8,7 @@ company_score: 당분간 비활성화 — 수집→fit 계산→추천 흐름을
 import json
 import logging
 import re
+from datetime import datetime, timedelta, timezone
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
@@ -37,6 +38,18 @@ FIT_SCORE_MAX = {
 # A1~A4 관문(학력·경력·필수 어학/자격·전공) 중 하나라도 fail이면 총점 상한
 FIT_GATE_FAIL_CAP = 30
 _GATE_KEYS = ("education", "career", "language_cert", "major")
+
+# 채점 규칙(_FIT_PROMPT·배점) 버전. 규칙을 바꾸면 1 올린다 — 이전 버전으로 매긴 점수는 구 점수가 되고,
+# 사용자가 요청할 때만 다시 채점한다(2026-10-15 결정).
+#   1: 항목별 배점 첫 버전(2026-10-14)
+#   2: 짧은 직무명(position)·한 줄 fit_reasons(2026-10-15)
+SCORER_VERSION = 2
+
+
+def is_stale_score(score, user_profile_version: int) -> bool:
+    """점수가 지금 프로필·채점 규칙과 다른 버전으로 매겨졌는지(= 구 점수)."""
+    return (score.scorer_version != SCORER_VERSION
+            or score.profile_version != user_profile_version)
 
 _FIT_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """당신은 신입 채용 공고와 지원자 프로필의 적합도를 평가하는 채용 담당자입니다.
@@ -126,9 +139,12 @@ JD:
   - evidence: 판단 근거가 된 원문 문장 그대로(한국어). 근거 없으면 빈 문자열
 - locations: 근무지 목록. 원문에 적힌 주소·지역명을 시/도부터 그대로 (예: "서울 강남구", "경기 성남시 분당구 판교역로").
   근무지가 여러 곳이면 모두, 명시가 없으면 빈 배열
+- deadline: 서류 접수 마감 일시. "YYYY-MM-DD HH:MM"(24시간제, 한국 시간), 시간이 없으면 "YYYY-MM-DD".
+  접수 기간이 "10월 12일 ~ 10월 28일 23:59"처럼 적혀 있으면 끝 날짜를 쓴다. 연도가 없으면 공고 맥락의 연도.
+  "상시채용", "채용 시 마감"처럼 날짜가 없으면 null. 서류 마감이 아닌 일정(발표일·면접일)은 쓰지 않는다
 
 아래 JSON 형식으로만 답하세요:
-{{"tasks": ["<업무>"], "stack": ["<기술>"], "employment_type": "<고용형태>", "qualifications": ["<자격요건>"], "preferred": ["<우대사항>"], "eligibility": {{"new_grad_ok": <true|false|null>, "min_years": <정수|null>, "evidence": "<원문 문장>"}}, "locations": ["<근무지>"]}}
+{{"tasks": ["<업무>"], "stack": ["<기술>"], "employment_type": "<고용형태>", "qualifications": ["<자격요건>"], "preferred": ["<우대사항>"], "eligibility": {{"new_grad_ok": <true|false|null>, "min_years": <정수|null>, "evidence": "<원문 문장>"}}, "locations": ["<근무지>"], "deadline": "<YYYY-MM-DD HH:MM 또는 null>"}}
 """),
 ])
 
@@ -304,12 +320,32 @@ def _parse_eligibility(data: dict) -> dict:
     }
 
 
+_KST = timezone(timedelta(hours=9))
+
+
+def _parse_deadline(value) -> datetime | None:
+    """요약의 deadline 문자열(한국 시간) → UTC datetime. 시간이 없으면 그날 23:59. 형식이 다르면 None."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    for fmt, has_time in (("%Y-%m-%d %H:%M", True), ("%Y-%m-%d", False)):
+        try:
+            parsed = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        if not has_time:
+            parsed = parsed.replace(hour=23, minute=59)
+        return parsed.replace(tzinfo=_KST).astimezone(timezone.utc)
+    return None
+
+
 def summarize_jd(jd_text: str, hints: dict | None = None) -> dict:
     """JD 원문(+선택적 채용구분 힌트) → 카드용 요약 + 신입 지원 가능 여부(eligibility) + 근무지(locations).
 
     hints는 크롤러가 채운 {"positions": [{"career_level": str, ...}]} 형태(자소설/잡코리아 등).
     JD 원문이 우선 근거이며, 힌트와 충돌하면 원문을 따르고 그 사실을 eligibility.evidence에 남기도록
     프롬프트에 지시한다. 알림 카드(제목·고용형태·'하는 일')와 상세 분석에 사용한다.
+    deadline은 본문에 적힌 서류 마감(UTC datetime, 없으면 None) — 목록에 마감일이 없는 사이트(인디스워크)용.
     파싱 실패 시 빈 구조를 반환해 카드에서 해당 블록이 생략되게 한다.
     """
     response = build_summary_chain().invoke({
@@ -332,6 +368,7 @@ def summarize_jd(jd_text: str, hints: dict | None = None) -> dict:
         "preferred": _str_list("preferred", 5),
         "eligibility": _parse_eligibility(data),
         "locations": _str_list("locations", 10),
+        "deadline": _parse_deadline(data.get("deadline")),
     }
 
 

@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
+from analysis.profile import mark_profile_changed
 from db.orm import Experience, User
 from web.deps import get_current_user, get_db
 
@@ -49,6 +50,7 @@ def update_basic_info(
     새 dict로 바꿔 넣어야 SQLAlchemy가 JSON 컬럼 변경을 감지한다.
     """
     current_user.basic_info = {**(current_user.basic_info or {}), "이름": name, "학력": education}
+    mark_profile_changed(current_user)
     db.commit()
     return RedirectResponse("/experiences", status_code=303)
 
@@ -72,6 +74,7 @@ def add_experience(
         content=content,
         tags=tag_list or None,
     ))
+    mark_profile_changed(current_user)
     db.commit()
     return RedirectResponse("/experiences", status_code=303)
 
@@ -83,6 +86,7 @@ def delete_experience(
     db: Session = Depends(get_db),
 ):
     """본인 소유 경험만 지울 수 있다 — user_id로 한 번 더 걸러서 남의 것 삭제를 막는다."""
-    db.query(Experience).filter_by(id=experience_id, user_id=current_user.id).delete()
+    if db.query(Experience).filter_by(id=experience_id, user_id=current_user.id).delete():
+        mark_profile_changed(current_user)
     db.commit()
     return RedirectResponse("/experiences", status_code=303)

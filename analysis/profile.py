@@ -69,3 +69,12 @@ def build_profile_text(
         sections.append(f"[{KIND_LABELS.get(kind, kind)}]\n" + "\n".join(items))
 
     return "\n\n".join(sections)
+
+
+def mark_profile_changed(user) -> None:
+    """프로필(basic_info·experiences)을 고친 뒤 호출한다 — profile_version을 1 올린다.
+
+    이전 버전으로 매긴 점수는 구 점수가 되고(analysis/scorer.py::is_stale_score), 사용자가 요청할 때만
+    다시 채점한다. 새로 들어오는 공고는 analyze_job이 바뀐 프로필로 채점한다. 커밋은 호출자가 한다.
+    """
+    user.profile_version = (user.profile_version or 1) + 1

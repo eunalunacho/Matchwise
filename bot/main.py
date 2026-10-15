@@ -4,13 +4,14 @@ docker-compose의 bot 서비스가 이 모듈을 실행한다.
   CMD ["python", "-m", "bot.main"]
 
 버튼 인터랙션 처리 및 슬래시 커맨드를 담당한다.
-(버튼 핸들러는 bot/interactions.py)
+(버튼 핸들러는 bot/interactions.py, 슬래시 명령어는 bot/commands.py)
 """
 import logging
 
 import discord
 from discord.ext import commands
 
+from bot.commands import setup_commands
 from bot.interactions import setup_interactions
 from shared.config import get_settings
 from shared.logger import setup_logging
@@ -28,6 +29,7 @@ def create_bot() -> commands.Bot:
         logger.info("봇 로그인 완료: %s (id=%s)", bot.user, bot.user.id)
 
     setup_interactions(bot)
+    setup_commands(bot)
     return bot
 
 

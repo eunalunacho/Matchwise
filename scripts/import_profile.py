@@ -8,7 +8,7 @@ profile.json은 개인 정보라 .gitignore 대상이다. 형식:
 kind 목록은 analysis/profile.py::KIND_LABELS.
 
 다시 실행하면 그 유저의 basic_info와 experiences를 파일 내용으로 통째로 바꾼다(중복으로 쌓이지 않음).
-이미 매긴 job_scores는 그대로라, 프로필을 바꾼 뒤 다시 채점하려면 그 점수를 따로 지워야 한다.
+적재하면 profile_version이 올라 이미 매긴 점수는 구 점수로 표시된다 — 다시 채점하려면 웹에서 재채점을 요청한다.
 
 Usage:
     python -m scripts.import_profile [profile.json 경로] [--user-id N]   (기본: ./profile.json, 1)
@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 
 from db.init_db import init
+from analysis.profile import mark_profile_changed
 from db.orm import Experience, User
 from shared.db import get_session
 
@@ -47,6 +48,7 @@ def import_profile(session, user_id: int, data: dict) -> int:
             content=item["content"],
             tags=item.get("tags"),
         ))
+    mark_profile_changed(user)
     session.commit()
     return len(items)
 

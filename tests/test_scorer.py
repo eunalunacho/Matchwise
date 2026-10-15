@@ -1,7 +1,13 @@
 """스코어러 유닛 테스트 — LLM/DART 모두 mock 처리."""
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from analysis.scorer import (
+    SCORER_VERSION,
+    _parse_deadline,
+    is_stale_score,
     score_company_from_dart,
     score_company_from_llm,
     summarize_jd,
@@ -128,7 +134,7 @@ def test_summarize_jd_malformed_returns_empty_structure():
     assert result == {
         "tasks": [], "stack": [], "employment_type": "",
         "qualifications": [], "preferred": [], "eligibility": _EMPTY_ELIGIBILITY,
-        "locations": [],
+        "locations": [], "deadline": None,
     }
 
 
@@ -201,3 +207,36 @@ def test_summarize_jd_joins_multiple_text_blocks_and_skips_non_text():
     with patch("analysis.scorer.build_summary_chain", return_value=chain):
         result = summarize_jd("JD")
     assert result["tasks"] == ["RAG 구축"]
+
+
+# ── 마감일 파싱·구 점수 판정 (2026-10-15) ───────────────────────────────
+
+def test_parse_deadline_reads_kst_and_returns_utc():
+    assert _parse_deadline("2026-10-28 23:59") == datetime(2026, 10, 28, 14, 59, tzinfo=timezone.utc)
+
+
+def test_parse_deadline_without_time_means_end_of_day_kst():
+    assert _parse_deadline("2026-10-31") == datetime(2026, 10, 31, 14, 59, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("value", [None, "", "null", "상시채용", "10월 28일", 20261028])
+def test_parse_deadline_rejects_non_dates(value):
+    assert _parse_deadline(value) is None
+
+
+def test_summarize_jd_returns_deadline_from_body():
+    chain = _mock_fit_chain('{"tasks": [], "deadline": "2026-10-25 23:59"}')
+    with patch("analysis.scorer.build_summary_chain", return_value=chain):
+        result = summarize_jd("2026.10.12 (월) ~ 2026.10.25 (일) 23:59까지")
+    assert result["deadline"] == datetime(2026, 10, 25, 14, 59, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("profile_version, scorer_version, user_version, stale", [
+    (2, SCORER_VERSION, 2, False),
+    (1, SCORER_VERSION, 2, True),       # 프로필이 바뀜
+    (2, SCORER_VERSION - 1, 2, True),   # 채점 규칙이 바뀜
+    (None, None, 1, True),              # 버전 기록 전에 매긴 점수
+])
+def test_is_stale_score(profile_version, scorer_version, user_version, stale):
+    score = MagicMock(profile_version=profile_version, scorer_version=scorer_version)
+    assert is_stale_score(score, user_version) is stale
