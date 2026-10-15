@@ -26,14 +26,14 @@ v3는 **v1의 기능 명세를 v2의 인프라 위에 되살린다.** v1과 v2�
 
 | # | 요구 | 담당 레이어 | 현재 상태 |
 |---|---|---|---|
-| ① | 쓸 만한 공고 자동 수집 | Layer 1 | ✅ 구현됨 (인디스워크·슈퍼루키) |
-| ② | 나에게 맞는 순서로 추천 | Layer 1 | 🟡 상위 3개 DM만, 전체 정렬 리스트는 대시보드 필요 |
+| ① | 쓸 만한 공고 자동 수집 | Layer 1 | ✅ 인디스워크·자소설·잡코리아 수집 + 추출·OCR (docs/superpowers/specs 참고). 청킹(`job_chunks`)은 미착수 |
+| ② | 나에게 맞는 순서로 추천 | Layer 1 | 🟡 매칭 채널에 오늘 채점된 공고 상위 3개 카드 + 나머지 스레드 + `/dashboard` 전체 점수순 목록. 신규공고 페이지(B3)는 미구현 |
 | ③ | "쓰겠다" 하면 내 기록 기반 초안 작성 | Layer 3 (Draft Agent) | 🟡 설계만 (LangGraph 미구현) |
-| ④ | "제출했다" 하면 일정 저장·리마인드 | Layer 2 | ❌ 없음 |
-| ⑤ | 쓰겠다 하고 안 쓰면 재촉 | Layer 2 | ❌ 없음 |
+| ④ | "제출했다" 하면 일정 저장·리마인드 | Layer 2 | 🟡 상태 저장은 됨(B1), 리마인드는 미구현(C2) |
+| ⑤ | 쓰겠다 하고 안 쓰면 재촉 | Layer 2 | 🟡 상태 추적은 됨(B1), 채널 알림은 미구현(C1/C2) |
 | ⑥ | 위키처럼 이력을 쓰면 전용 기억저장소 구축 | Layer 3 (Memory Agent) | ❌ 텍스트 blob 2개뿐 |
 | ⑦ | 외부 서비스(GitHub 등) 업데이트 추적 → 기억저장소 갱신 | Layer 3 (Memory Agent) | ❌ 없음 |
-| ⑧ | 형태 잡히면 친구들도 쓰는 서비스로 | 전체 | 🟡 스키마는 멀티유저 전제, 온보딩·가드레일 없음 |
+| ⑧ | 형태 잡히면 친구들도 쓰는 서비스로 | 전체 | 🟡 구글 로그인 + Discord 연결 완료. 유저당 분석 상한 없음(전체 공유 상한만) |
 
 ---
 
@@ -44,14 +44,26 @@ AWS EC2 t2.micro — Docker Compose
 │
 ├─ Layer 1. 파이프라인  (v2 승계 — 일반 코드, 에이전트 아님)
 │    scheduler (APScheduler)
-│      02:00 → crawler   (Playwright+BS4: 인디스워크, 슈퍼루키)
-│      05:00 → analysis  (Gemini Flash: fit_score / DART: company_score)
-│      09:00 → bot 알림  (discord.py: 유저별 상위 3개 DM)
+│      02:00 → run_crawl_pipeline (crawl_job → extract_job 순차 함수 호출, 워크플로우 체인 —
+│                                  고정 시간에 따로 도는 게 아니라 크롤링이 끝나면 바로 추출로 이어짐)
+│                                  crawl_job:   인디스워크 WordPress API · 자소설 API · 잡코리아 HTTP
+│                                               (on/off는 _enabled_crawlers() 한 곳)
+│                                  extract_job: pending·failed·needs_ocr를 추출(jd_tasks 등 +
+│                                               eligibility). needs_ocr는 OCR(기본 Google Cloud
+│                                               Document AI, OCR_PROVIDER로 Claude Code 전환 가능)로
+│                                               이미지→텍스트 변환 후 곧바로 같은 실행에서 추출까지
+│                                               진행(raw_postings는 안 건드림). OCR 자체가 실패하면
+│                                               상태를 needs_ocr로 유지해 다음 실행에 재시도.
+│                                               empty만 계속 보류(텍스트·이미지 둘 다 없음)
+│      05:00 → analysis  (Gemini Flash: fit_score. 추출 완료(ok) + 신입 가능/모름 + 서울·과천·판교·분당/미기재만.
+│                         extract_job과 하루 Gemini 호출 상한 400건 공유
+│                         / DART company_score는 비활성화)
+│      09:00 → bot 알림  (discord.py: 매칭 채널에 오늘 채점분 상위 3개 + 스레드)
 │    요구 ①② 담당
 │
 ├─ Layer 2. 지원 관리  (v1 Application Manager 개념을 새 인프라로)
-│    applications 테이블 (상태머신) + Discord 버튼 [쓰겠다][제출했다]
-│    scheduler 잡: 재촉(D-3/D-1), 면접 리마인드 — LLM 불필요
+│    applications 테이블 (상태머신) + Discord 버튼 [자세히 보기][목록에 등록][패스] (5-2)
+│    scheduler 잡(미구현): 채널 3일 현황 공유(5-3), 마감 D-7/D-2 리마인드(5-4) — LLM 불필요
 │    요구 ④⑤ 담당
 │
 ├─ Layer 3. 에이전트  (LangGraph — 포트폴리오 코어)
@@ -67,21 +79,22 @@ AWS EC2 t2.micro — Docker Compose
 
 ---
 
-## 4. Layer 1 — 파이프라인 (v2 승계, 변경 없음)
+## 4. Layer 1 — 파이프라인 (v2 승계 + JD 저장 계층)
 
-v2 설계 그대로 유지. 상세 스키마(users, jobs, job_scores, application_questions, resume_drafts)와 일일 플로우는 v2 문서 내용과 동일하며 코드(`crawler/`, `analysis/`, `scheduler/`, `bot/`, `db/orm.py`)가 이미 구현하고 있다.
+v2의 일일 플로우를 유지하되, 수집 단계는 [JD 저장 설계](docs/superpowers/specs/2026-09-24-jd-storage-design.md)대로 원본(`raw_postings`) → 정리(`jobs`) 계층으로 바뀌었다. 코드는 `crawler/`, `analysis/`, `scheduler/`, `bot/`, `db/orm.py`.
 
-- **크롤링(02:00)**: 신규 공고만 URL 기준 중복 제거 후 `jobs` 저장
-- **분석(05:00)**: (신규 공고 × 활성 유저) 조합마다 Gemini Flash로 `fit_score`(0-100), `fit_reasons` 산출. `company_score`는 DART 재무 데이터 우선, 없으면 LLM 폴백. 무료 티어 레이트리밋 대응(배치 분산)
-- **알림(09:00)**: 유저별 상위 3개 Discord DM + 버튼
-
-v3에서 Layer 1에 추가되는 것은 **알림 메시지의 버튼 구성뿐** (Layer 2의 `[쓰겠다]` `[제출했다]` 버튼 추가).
+- **수집·추출(02:00, `run_crawl_pipeline`)**: `crawl_job`이 신규 공고를 URL 기준 중복 제거 후 `raw_postings`(원본 그대로)와 `jobs`(`extract_status` 자동 분류)에 저장하고 사이트별 결과를 로그 파일(`logs/<프로그램>.log`, 최근 7일 보관)에 기록 → 이어서 `extract_job`이 JD 요약(`jd_*`)·`eligibility`·근무지(`work_locations`)를 채우고 이미지 JD는 OCR. 실패(`failed`·`needs_ocr`)는 수집한 날 + 다음 날까지만 재시도. 진행 상황(시작·수집 완료·추출 완료·에러)은 Discord 비공개 채널 웹훅으로 전송
+- **분석(05:00)**: 채점 대상은 `extract_status='ok'`이고 아직 점수가 없는 (공고 × 활성 유저) 조합 중, 하는 일(`jd_tasks`)이 비어 있지 않고, 신입 불가(`eligibility.new_grad_ok=false`)가 아니고 근무지(`work_locations`)가 서울·과천·판교·분당 중 하나이거나 미기재인 공고(2026-10-14 결정 — 정보가 없으면 채점, 명시적으로 안 맞는 것만 제외). 조합마다 Gemini Flash가 직무 선택·관문(학력·경력·필수 어학/자격·전공)·항목 점수(직무 방향 30·필수 스택 15·업무 경험 20·우대 20·근거 강도 10·도메인 5)를 매기면 코드가 총점(`fit_score`, 우대사항 없으면 100점 환산, 관문 fail이면 30점 상한)을 계산해 `fit_reasons`·`fit_detail`(JSON)과 함께 저장(2026-10-14). 답을 해석 못 하면 저장하지 않고 다음 실행에 재시도. 근거는 `users.basic_info` + `experiences`를 `analysis/profile.py::build_profile_text()`로 펼친 프로필 텍스트(2026-10-14 전환, 둘 다 비어 있는 유저는 채점 건너뜀). `company_score`는 비활성화(DART/LLM 계산 함수만 보존). 하루 호출 상한 400건을 `extract_job`과 공유(`gemini_usage` 테이블)
+- **알림(09:00)**: 매칭 채널(`DISCORD_MATCH_CHANNEL_ID`)에 오늘(KST 0시 이후) 채점된 공고만 — 어제 이전 점수는 이미 보냈으므로 매일 같은 공고가 반복되지 않는다. 상위 3개는 카드(제목 `[회사] 직무명 (고용형태)`, 본문 하는 일 + 왜 나랑 맞나, 3버튼 5-2), 나머지는 스레드에 `회사 — 직무 · 점수` 한 줄 링크. fit_score 50점 미만·패스한 공고 제외 (2026-10-15)
+- **정리(01:00, `cleanup_job`)**: 마감 지난 `jobs`와 점수·질문·초안 삭제. `applications`가 있는 공고와 `raw_postings`는 보존
 
 ---
 
 ## 5. Layer 2 — 지원 관리
 
-### 5-1. applications 테이블
+> 2026-08-11 구체화(v3.1). 아래 5-2~5-8은 실사용 요구를 반영해 처음보다 구체적으로 확정한 내용이며, 일부는 판단이 필요해 **[결정]** 태그로 명시하고 11절 미결 사항에도 정리했다.
+
+### 5-1. applications 테이블 (구현됨)
 
 ```sql
 CREATE TABLE applications (
@@ -98,23 +111,85 @@ CREATE TABLE applications (
 );
 ```
 
-### 5-2. 상태 전이
+### 5-2. Discord 매칭 채널 — 일일 추천 카드 (버튼 3종으로 축소)
 
-```
-interested ──[쓰겠다]──▶ will_apply ──[제출했다]──▶ submitted ──▶ rejected | passed
-                              │
-                              └─ (미제출 + 마감 임박) → 재촉 대상
-```
+**2026-10-15 결정 — 뉴스레터와 비서를 위치로 나눈다**: 매일 매칭 공고(훑어보는 정보)는 **채널**, 지원 현황·마감 리마인드·초안 완성처럼 나에게 할 일을 알리는 '비서' 메시지는 **DM**, 수집 진행 로그는 웹훅 채널(`DISCORD_INGEST_WEBHOOK_URL`). 매칭 카드는 버튼이 있어 웹훅이 아니라 봇이 보낸다. 멀티유저가 되면 공유 채널에 개인 점수가 보이므로 유저별 비공개 채널로 바꾼다. 이 결정으로 아래 5-3·5-4의 "채널"은 DM으로 바뀐다.
 
-- `[쓰겠다]` 클릭 → `status='will_apply'`, `will_apply_at` 기록 → Draft Agent 트리거 대상 + 재촉 감시 대상
-- `[제출했다]` 클릭 → `status='submitted'`, `submitted_at` 기록 → 재촉 해제, 리마인드 대상으로 전환
+기존에 만들었던 5버튼(상세분석/이력서작성하기/쓰겠다/제출했다/별로임) 구성을 **3버튼으로 되돌린다** — "실제 입력·내용 확인은 웹에서만" 원칙에 맞춰 카드는 순수 알림 역할만 한다.
 
-### 5-3. scheduler 잡 (기존 02/05/09시 패턴에 추가)
-
-| 잡 | 조건 | 동작 |
+| 버튼 | 종류 | 동작 |
 |---|---|---|
-| 재촉 (10:00) | `status='will_apply' AND submitted_at IS NULL AND deadline` D-3, D-1 | "쓰기로 한 공고, 아직 제출 안 하셨어요" DM |
-| 리마인드 (10:00) | `status='submitted' AND interview_at` D-1 | "내일 면접" DM |
+| 자세히 보기 | 링크 버튼 (`style=link`, `url=job.url`) | 스크랩한 원본 공고로 바로 이동. Discord 인터랙션 자체가 안 뜸 — DB 왕복 없음 |
+| 목록에 등록 | 일반 버튼 | `applications.status='will_apply'` 즉시 기록(가벼운 상태 마킹) + ephemeral 응답으로 웹 작성 페이지 링크(`/jobs/{id}/apply`) 안내 |
+| 패스 | 일반 버튼 | 기존 `dismissed` 마킹과 동일 — 이후 추천에서 완전 제외 |
+
+**[결정]** "목록에 등록"은 상태만 즉시 DB에 쓰고(가벼운 북마크), 자소서 같은 실제 콘텐츠 작성·저장은 전부 웹에서만 일어난다 — "클릭 즉시 DB 반영 금지" 원칙은 콘텐츠에 대해서만 적용, 상태 마킹에는 적용하지 않는 걸로 해석했다.
+
+### 5-3. Discord DM — 3일 주기 현황 공유
+
+3일마다 **DM**으로 현황 요약을 보낸다 (`IntervalTrigger(days=3)`, 2026-10-15 채널→DM).
+
+| 섹션 | 조건 | 최대 |
+|---|---|---|
+| 작성 중 | `status='will_apply'` AND 해당 job에 `resume_drafts` 1건 이상 존재 | 3건 |
+| 미작성 | `status='will_apply'` AND `resume_drafts` 0건 | 3건 |
+| 놓치고 있는 추천 | `application` 레코드 없음(= "목록에 등록" 안 누름) AND `fit_score >= 50` | 3건 |
+
+DM 대상은 `users.discord_id` — 로컬 DB의 유저 1은 아직 비어 있어 이 기능 착수 시 채워야 한다.
+
+### 5-4. Discord DM — 마감 리마인드 (D-7 / D-2)
+
+| 조건 | 동작 |
+|---|---|
+| `status='will_apply' AND submitted_at IS NULL AND deadline` D-7 또는 D-2 | DM으로 "마감 D-N, 아직 제출 전이에요" 전송 |
+
+**[결정]** 기존 설계(D-3/D-1, DM)를 **D-7/D-2**로 교체한다. 위치는 2026-08 "채널+태그"에서 2026-10-15 **DM**으로 다시 바꿨다(5-2 뉴스레터/비서 분리).
+
+### 5-5. 웹 — 메인 페이지
+
+버튼/링크 4개:
+
+1. 내가 "목록에 등록"한 공고 일정 캘린더
+2. 신규공고 보기
+3. 작성중인 공고 보기
+4. 경력·자기소개서 업데이트
+
+### 5-6. 웹 — 신규공고 페이지
+
+- 대상: `fit_score >= 50` AND `jobs.crawled_at >= now() - 7일`
+- 표시: 공고명, 마감일, 내 액션 상태(`will_apply` / `passed` / 없음)
+
+### 5-7. 웹 — 작성중인 공고 페이지 + 작성 페이지
+
+- 목록: `status='will_apply'` 인 것만, 마감일 순 정렬
+- 클릭 → `/jobs/{id}/apply`: 상단에 원본 공고 링크(`job.url`), 하단에 `application_questions`별 입력창 — 각 질문에 [초안 생성] 누르면 LLM이 5-8의 경험 데이터를 근거로 초안 작성, 편집 후 저장하면 `resume_drafts`에 반영. 같은 페이지에 "제출완료로 표시" 체크박스(→ `status='submitted'`, `submitted_at` 기록)
+
+**[결정]** "마감일 내림차순"이라고 하셨는데, 지금까지 일관되게 "마감 가까운 걸 먼저" 써왔던 것과 반대라 오름차순(가까운 순)으로 해석했다 — 아니면 알려주세요.
+
+### 5-8. 웹 — 경력·자기소개서 업데이트 페이지 (경험 조각 저장, RAG 없음)
+
+문서 통째로 쓰는 페이지가 아니라 **재사용 가능한 경험 조각**을 저장하는 페이지.
+
+- 기본 정보(이름·학력 등): LLM 안 거치고 폼 입력 그대로 저장 — `users.basic_info JSON` 신규 컬럼
+- 경험 조각(경력/프로젝트/자소서용 에피소드): 신규 `experiences` 테이블 — pgvector 없이 단순 저장, 초안 생성 시 유저의 경험 조각 전부를 LLM 컨텍스트에 넣는 방식(RAG 아님, 6-1과 다른 경량 버전)
+
+```sql
+CREATE TABLE experiences (
+    id         SERIAL PRIMARY KEY,
+    user_id    INTEGER REFERENCES users(id),
+    kind       VARCHAR(32) NOT NULL,  -- 'career' | 'project' | 'story'
+    title      VARCHAR(256),
+    period     VARCHAR(64),
+    content    TEXT NOT NULL,
+    tags       TEXT[],
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**2026-10-14 항목 확정**: `basic_info`(한 사람에 하나씩 정해진 칸) = 이름·생년월일·병역·취업우대(보훈·장애)·고등학교·대학교·공인외국어시험·자격증·컴퓨터활용능력·링크. `experiences.kind`(개수가 늘어나는 서술형) = `career`(경력사항)·`project`(프로젝트)·`award`(수상)·`campus`(교내활동)·`club`(동아리)·`team_project`(팀프로젝트·공모전)·`education`(교육이수)·`volunteer`(봉사)·`story`(자소서 에피소드). 처음 데이터는 로컬 위키 + 사용자 최신 이력서로 만든 `profile.json`(gitignore)을 `python -m scripts.import_profile`로 적재 — 다시 실행하면 파일 내용으로 통째로 교체. 웹 기본 정보 폼은 이름·학력 두 칸만 바꾸고 나머지 항목은 보존한다.
+
+**[결정]** 초안 생성 근거를 "resume_text/experience_text 블롭 그대로 LLM에" 방식으로 이미 합의했었는데, 이 페이지가 생기면서 근거 데이터가 그 블롭이 아니라 **이 `experiences` 조각들**로 바뀐다 — 방식(LLM 컨텍스트에 통째로 주입, pgvector 없음)은 동일하게 유지, 데이터 소스만 구조화된 걸로 교체.
 
 Discord 버튼 3초 응답 제한은 v2와 동일하게 즉시 ACK 후 비동기 처리.
 
@@ -124,26 +199,20 @@ Discord 버튼 3초 응답 제한은 v2와 동일하게 즉시 ACK 후 비동기
 
 > Layer 3는 `memory/`, `draft/` 패키지로 구현하되 **Matchwise 본체와 인터페이스로 분리**한다. 특히 Memory Agent는 "개인 기억저장소"라는 독립 프로젝트로 추출 가능한 구조를 유지한다 (별도 레포 분리는 안정화 후 판단).
 
-### 6-1. experiences 테이블 (pgvector)
+### 6-1. experiences 테이블 (pgvector) — 5-8 경량 버전의 확장판
+
+`experiences` 테이블은 5-8에서 **pgvector 없는 경량 버전**(`kind`/`title`/`period`/`content`/`tags`)으로 먼저 만든다. 이 절은 그 테이블에 검색·동기화가 실제로 필요해졌을 때(경험 조각이 많아져서 LLM 컨텍스트에 전부 넣기 부담스러워지는 시점) 아래 컬럼을 `ALTER TABLE`로 추가하는 확장판이다 — 별도 테이블이 아니다.
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS vector;
 
-CREATE TABLE experiences (
-    id         SERIAL PRIMARY KEY,
-    user_id    INTEGER REFERENCES users(id),
-    title      VARCHAR(256),
-    tags       TEXT[],
-    period     VARCHAR(64),
-    content    TEXT,
-    embedding  VECTOR(768),
-    source     VARCHAR(64),   -- 'wiki' | 'github' | 'manual'
-    source_ref VARCHAR(512),  -- 원본 경로/URL (재동기화 키)
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
+ALTER TABLE experiences
+    ADD COLUMN embedding  VECTOR(768),
+    ADD COLUMN source     VARCHAR(64),   -- 'wiki' | 'github' | 'manual' (5-8 수기 입력분은 'manual')
+    ADD COLUMN source_ref VARCHAR(512);  -- 원본 경로/URL (재동기화 키)
 ```
 
-기존 `users.resume_text` / `experience_text` blob은 초기 마이그레이션 후 deprecated.
+기존 `users.resume_text` / `experience_text` blob은 5-8 도입 후 deprecated.
 
 ### 6-2. Memory Agent — 요구 ⑥⑦
 
@@ -208,12 +277,34 @@ save_drafts            resume_drafts 저장 → Discord로 웹 링크 DM
 | Agent 테스트·성능 평가·개선 | 6-5 평가 체계 |
 | 문서화 | 본 설계 문서 + 레포 문서 |
 
+### 6-7. 크롤러 온보딩 에이전트 (확장 아이디어, 우선순위 미정)
+
+**배경**: 크롤링을 Claude Code(OAuth 구독) + Skills로 대체하는 안을 검토했으나, 이미 안정적으로 동작하는 인디스워크 크롤러(Phase A)를 에이전트로 교체하는 건 이력/설계 관점에서 이득이 적다고 판단했다 — 제어 로직이 Claude Code의 내장 에이전트 루프 안에 있어 "직접 설계한 에이전트"로 보기 어렵고, 설계 원칙 1번(반복 배치는 일반 코드로)과도 충돌한다. 대신 **일반 코드로 처리 못 하는 지점** — 신규 채용 사이트를 추가할 때마다 사람이 selector를 새로 짜야 하는 부분 — 을 에이전트화한다.
+
+**역할**: 신규 채용 사이트 URL을 주면, 페이지 구조를 스스로 파악해 목록/상세 추출 스키마(선택자·추출 규칙)를 제안하고 검증한다.
+
+**Tools**:
+
+| Tool | 기능 |
+|---|---|
+| `fetch_page(url)` | 페이지 HTML/구조 로드 |
+| `propose_extraction_schema(html)` | title/company/url/deadline 등 필드의 추출 규칙 제안 |
+| `validate_extraction(schema, html)` | 제안된 스키마로 샘플 추출 후 정확도 확인 |
+
+**인증**: Claude Pro/Max OAuth 프로필(`anthropic.Anthropic()` 제로-인자 클라이언트, 6-4와 동일) — 별도 API 과금 없이 구독 재사용. Claude Code CLI/Skills가 아니라 **직접 설계한 tool-calling 루프**로 구현해 Agent/Tool 설계 역량이 코드로 남도록 한다.
+
+**적용 범위**: 매일 도는 기존 2개 사이트 크롤러(Phase A)는 그대로 유지 — 신규 사이트 추가 시에만 사용.
+
+**의존성**: Layer 1 안정화 이후. 우선순위 낮음, 착수 시점 미정.
+
 ---
 
 ## 7. LLM 호출 설계 (전체 요약)
 
 | 호출 지점 | 빈도·볼륨 | 요구 품질 | LLM | 인증 |
 |---|---|---|---|---|
+| JD 요약·eligibility 추출 (02:00, `extract_job`) | 中 (신규 공고당 1회) | 중간 | Gemini Flash | API 키 (무료 티어) |
+| 이미지 JD OCR (02:00, `extract_job`) | 中 (이미지 공고당 1회) | 높음 (원문 그대로) | Google Document AI (기본) / Claude Code 헤드리스 sonnet (선택) | ADC / 구독 로그인 |
 | fit_score 배치 (05:00) | 高 (유저×신규공고, 몰림) | 낮음 (채점) | Gemini Flash | API 키 (무료 티어) |
 | JD 요구사항 추출 (Draft 전처리) | 低 | 중간 | Gemini Flash | API 키 |
 | 초안 생성·일관성 검토 | 低 (버튼 클릭 시) | **높음** | Claude (Pro) | OAuth 프로필 |
@@ -228,23 +319,31 @@ save_drafts            resume_drafts 저장 → Discord로 웹 링크 DM
 | 벡터 검색 | (없음) | **pgvector** (기존 Postgres 확장) |
 | 초안 생성 LLM | Gemini Flash | **Claude Pro (OAuth)** |
 | Agent 프레임워크 | LangGraph (계획만) | LangGraph (Memory + Draft 2개 그래프) |
-| 나머지 | Python 3.12 · FastAPI · discord.py · Playwright · PostgreSQL 16 · APScheduler · Docker Compose · EC2 | 동일 |
+| 크롤링 | Playwright | **httpx만** (사이트 API/HTML 직접 호출, 브라우저 없음) |
+| OCR | (없음) | **Google Cloud Document AI** |
+| 나머지 | Python 3.12 · FastAPI · discord.py · PostgreSQL 16 · APScheduler · Docker Compose · EC2 | 동일 |
 
 ---
 
 ## 9. 로드맵
 
-| Phase | 내용 | 요구 | 의존성 |
-|---|---|---|---|
-| **A** | (진행 중) Layer 1 완성 — 봇 버튼 인터랙션, web-api 대시보드 | ①② | — |
-| **B** | `applications` 테이블 + `[쓰겠다]`/`[제출했다]` 버튼 | ④⑤ 토대 | A |
-| **C** | 재촉·리마인드 scheduler 잡 | ④⑤ | B |
-| **D** | pgvector + `experiences` + 위키 임포트 (`scripts/import_wiki.py`) | ⑥ | A |
-| **E** | Draft Agent (LangGraph + RAG + Claude Pro OAuth) + 평가셋 | ③ | D |
-| **F** | GitHub 동기화 (Memory Agent `sync_github`) | ⑦ | D |
-| **G** | 멀티유저 — `/register` 슬래시 커맨드 온보딩, 유저당 일일 분석 상한 | ⑧ | A~F 안정화 |
+| Phase | 내용 | 요구 | 상태 | 의존성 |
+|---|---|---|---|---|
+| **A** | Layer 1 완성 — 봇 버튼 인터랙션, web-api 대시보드 | ①② | ✅ 완료 (JD 저장 계층 1·2차까지. 3차 `job_chunks`는 스펙 문서에서 관리) | — |
+| **B1** | `applications` 테이블 | ④⑤ 토대 | ✅ 구현됨 | A |
+| **B2** | Discord DM 3버튼(자세히보기/목록등록/패스)으로 재정리 (5-2) | ④⑤ | ✅ 완료 — 단 "목록에 등록" 응답의 링크 `/jobs/{id}/apply`는 B5 전까지 404 | B1 |
+| **B3** | 웹: 메인/신규공고/작성중공고 페이지 (5-5, 5-6, 5-7 목록부) | ②④ | ❌ 없음 | B1 |
+| **B4** | 경험 조각 저장 페이지 (5-8, pgvector 없음) | ③ 토대 | ✅ 완료 (`/experiences`) | — (독립) |
+| **B5** | 작성 페이지 + LLM 자동 초안 생성 (5-7 작성부) | ③ | ❌ 없음 (지금은 `/jobs/{id}` 질문 등록 + `/draft/{id}` 조회만, 초안을 만드는 코드 없음) | B3, B4 |
+| **C1** | 채널 3일 현황 공유 (5-3) | ④⑤ | ❌ 없음, `DISCORD_CHANNEL_ID` 설정 필요 | B1 |
+| **C2** | 마감 리마인드 D-7/D-2, DM (5-4) | ④⑤ | ❌ 없음 (D-3/D-1·DM 버전은 폐기) | B1 |
+| **D** | pgvector로 `experiences` 확장 (6-1) | ⑥ | 보류 — B4 데이터 많아지면 착수 | B4 |
+| **E** | Draft Agent를 LangGraph StateGraph로 고도화 (6-3) | ③ | 보류 — B5(직접 LLM 호출)로 우선 충분 | D |
+| **F** | GitHub 동기화 (Memory Agent `sync_github`) | ⑦ | ❌ 없음 | D |
+| **G** | 멀티유저 — ~~`/register` 슬래시 커맨드~~ **구글 로그인 + Discord 계정 연결**(2026-08-13 방향 전환), 유저당 일일 분석 상한 | ⑧ | ✅ 로그인/연결 완료, 일일 상한은 미착수 | B~F 안정화 |
+| **H** | 크롤러 온보딩 에이전트 (6-7) | 확장 (①) | ❌ 없음, 우선순위 낮음 | A 안정화 |
 
-B/C와 D/E/F는 상호 독립 — 병렬 진행 가능.
+B4는 다른 B*와 독립적으로 바로 시작 가능. C1/C2는 B1만 있으면 되고 B2~B5와 병렬 가능. D/E/F/G/H는 보류 또는 후순위.
 
 ---
 
@@ -264,9 +363,15 @@ B/C와 D/E/F는 상호 독립 — 병렬 진행 가능.
 ## 11. 미결 사항
 
 1. **GitHub 동기화 대상**: 전체 소유 repo vs 지정 repo 목록 (Phase F 착수 전 결정)
-2. **pgvector 실측**: t2.micro에서 확장 설치 + 임베딩 768차원 × 예상 수백 행 규모 검증 (Phase D 첫 작업)
+2. **pgvector 실측**: t2.micro에서 확장 설치 + 임베딩 768차원 × 예상 수백 행 규모 검증 (Phase D 첫 작업, 보류 중)
 3. **Memory Agent 독립 레포 분리 시점**: Phase D~F 완료 후 판단
 4. **임베딩 모델**: Gemini `text-embedding-004`(768d, 무료) 기본. 품질 이슈 시 재검토
+5. **(신규) 작성중인 공고 목록 정렬 방향**: 5-7에서 마감일 오름차순(가까운 순)으로 임시 결정 — 확인 필요
+6. **(신규) "원본 지원 페이지" 정의**: 지금은 `job.url`(스크랩한 목록 링크)로 임시 결정. 실제 지원 폼 URL이 따로 있는 사이트가 나오면 별도 필드 필요할 수 있음
+7. **(신규) `users.basic_info` 필드 범위**: "이름·학력 등"에서 "등"이 구체적으로 뭘 포함하는지 미정 (나이/연락처/포트폴리오 링크 등) — 웹 폼 설계 시 확정
+8. **(신규) 초안 자동 생성 트리거**: 질문마다 개별 [초안 생성] 버튼인지, 페이지 진입 시 전체 질문 일괄 생성인지 미정
+9. **(2026-10-14) 서버 배포·멀티유저 방식 보류**: 우선 내 PC에서만 돌린다. 친구들이 AI 툴을 주로 쓰므로 웹페이지를 계속 만들지, 다른 형태로 제공할지 기능 완성 후 재논의. 그때 Google API 인증도 함께 결정 — 후보: 로컬은 ADC 파일 마운트, EC2면 Workload Identity Federation(키 없음), GCP로 옮기면 VM에 서비스 계정 부착. 서비스 계정 키 파일은 비추천
+10. **(2026-10-15, 이후 할 일) 사이트 간 중복 공고 제거**: 같은 공고가 여러 사이트에서 따로 수집돼 두 번 채점·추천된다(예: 애경 AK아이에스 2027 신입 공채 — 인디스워크 84점·잡코리아 82점). 지금 중복 기준은 사이트 안의 URL뿐이다. 후보: `apply_url`(기업 채용 페이지) 정규화 일치, 또는 회사명+제목 유사도. 알림 단계에서 같은 회사·같은 직무를 하나로 묶는 것부터 검토
 
 ---
 
@@ -277,3 +382,5 @@ B/C와 D/E/F는 상호 독립 — 병렬 진행 가능.
 | v1 | 2025-02 | AWS 멀티에이전트 구상 (미구현) | `docs/archive/2025-02-design-v1-aws.md` |
 | v2 | 2026-06-27 | 단일 파이프라인 축소, 구현 착수 | 본 문서 Layer 1로 흡수 |
 | v3 | 2026-07-13 | 3-레이어 통합 — v1 기능 명세 × v2 인프라 + 요구 8종 + LLM 이원화 | 본 문서 |
+| v3.1 | 2026-08-11 | Layer 2 구체화 — Discord 3버튼, 채널 현황/리마인드, 웹 5개 페이지, 경험 조각 저장(pgvector 없는 경량판) | 본 문서 5절 |
+| v3.2 | 2026-10-14 | 코드 기준 현행화 — Layer 1에 JD 저장 계층(raw_postings·extract_job·OCR)·크롤러 3곳 반영, Playwright 제거, company_score 비활성화 명시, 로드맵 상태 갱신 | 본 문서 2·3·4·7·8·9절 |

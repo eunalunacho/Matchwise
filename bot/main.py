@@ -13,11 +13,8 @@ from discord.ext import commands
 
 from bot.interactions import setup_interactions
 from shared.config import get_settings
+from shared.logger import setup_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 
@@ -35,6 +32,7 @@ def create_bot() -> commands.Bot:
 
 
 def main() -> None:
+    setup_logging("bot")  # 콘솔 + logs/bot.log(최근 7일 보관)
     settings = get_settings()
     token = settings.discord.bot_token.get_secret_value()
     bot = create_bot()

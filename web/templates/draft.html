@@ -11,19 +11,18 @@
 {% for q_id, data in drafts_by_q.items() %}
 <div class="card">
   <h3>Q. {{ data.question }}</h3>
-  {% for draft, user in data.drafts %}
+  {% if data.draft %}
   <div style="margin-top:1rem; padding-left:1rem; border-left:4px solid #4f46e5;">
-    <strong>{{ user.username }}</strong>
-    <pre id="draft-{{ draft.id }}"
-         style="white-space:pre-wrap; font-family:sans-serif; margin:0.5rem 0;">{{ draft.answer }}</pre>
+    <pre id="draft-{{ data.draft.id }}"
+         style="white-space:pre-wrap; font-family:sans-serif; margin:0.5rem 0;">{{ data.draft.answer }}</pre>
     <button class="btn"
-            onclick="navigator.clipboard.writeText(document.getElementById('draft-{{ draft.id }}').textContent)">
+            onclick="navigator.clipboard.writeText(document.getElementById('draft-{{ data.draft.id }}').textContent)">
       복사
     </button>
   </div>
   {% else %}
   <p style="color:#6b7280;">아직 이 질문에 대한 초안이 없습니다.</p>
-  {% endfor %}
+  {% endif %}
 </div>
 {% endfor %}
 {% endblock %}

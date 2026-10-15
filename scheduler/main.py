@@ -9,26 +9,32 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from shared.config import get_settings
-from scheduler.jobs import crawl_job, analyze_job, notify_job
+from scheduler.jobs import cleanup_job, run_crawl_pipeline, analyze_job, notify_job
+from shared.logger import setup_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 
 def main() -> None:
+    setup_logging("scheduler")  # 콘솔 + logs/scheduler.log(최근 7일 보관)
     settings = get_settings()
     tz = settings.schedule.timezone
 
     scheduler = BlockingScheduler(timezone=tz)
 
     scheduler.add_job(
-        crawl_job,
+        cleanup_job,
+        CronTrigger(hour=settings.schedule.cleanup_hour, minute=0, timezone=tz),
+        id="cleanup",
+        name="마감 공고 정리",
+        max_instances=1,
+        misfire_grace_time=600,
+    )
+    scheduler.add_job(
+        run_crawl_pipeline,
         CronTrigger(hour=settings.schedule.crawl_hour, minute=0, timezone=tz),
         id="crawl",
-        name="공고 수집",
+        name="공고 수집 → 추출 파이프라인",
         max_instances=1,        # 중복 실행 방지
         misfire_grace_time=600, # 10분 내 지연 실행 허용
     )
@@ -50,8 +56,9 @@ def main() -> None:
     )
 
     logger.info(
-        "스케줄러 시작 (timezone=%s) — crawl=%d:00, analyze=%d:00, notify=%d:00",
+        "스케줄러 시작 (timezone=%s) — cleanup=%d:00, crawl=%d:00, analyze=%d:00, notify=%d:00",
         tz,
+        settings.schedule.cleanup_hour,
         settings.schedule.crawl_hour,
         settings.schedule.analyze_hour,
         settings.schedule.brief_hour,

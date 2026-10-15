@@ -1,7 +1,7 @@
 """Discord 알림 유닛 테스트.
 
 format_job_message: 실제 discord.Embed/View 객체를 생성해 필드를 검증한다.
-send_daily_notifications: discord.Client와 DB를 모두 mock으로 대체한다.
+send_daily_notifications: discord.Client는 mock, DB는 테스트용 SQLite 세션.
 """
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -26,7 +26,12 @@ def _make_job(
     job.company = "Acme"
     job.url = "https://example.com/job/1"
     job.deadline = deadline
-    job.jd_summary = jd_summary
+    summary = jd_summary or {}
+    job.jd_tasks = summary.get("tasks")
+    job.jd_stack = summary.get("stack")
+    job.jd_employment_type = summary.get("employment_type")
+    job.jd_qualifications = summary.get("qualifications")
+    job.jd_preferred = summary.get("preferred")
     return job
 
 
@@ -35,47 +40,15 @@ def _make_score(
     company_score: int = 70,
     user_id: int = 42,
     fit_reasons: str | None = "Python 경험",
+    position: str | None = None,
 ) -> MagicMock:
     score = MagicMock(spec=JobScore)
     score.fit_score = fit_score
     score.company_score = company_score
     score.user_id = user_id
     score.fit_reasons = fit_reasons
+    score.fit_detail = {"position": position} if position is not None else None
     return score
-
-
-def _make_notify_session(users: list, scores: list) -> MagicMock:
-    """send_daily_notifications의 두 쿼리 체인을 모사한다."""
-    session = MagicMock()
-
-    def query_side_effect(model):
-        mock_q = MagicMock()
-        if model is User:
-            mock_q.filter_by.return_value.all.return_value = users
-        elif model is JobScore:
-            (
-                mock_q.join.return_value
-                .filter.return_value
-                .filter.return_value
-                .filter.return_value
-                .order_by.return_value
-                .limit.return_value
-                .all.return_value
-            ) = scores
-        return mock_q
-
-    session.query.side_effect = query_side_effect
-    return session
-
-
-def _make_discord_mock() -> tuple[AsyncMock, AsyncMock]:
-    """(mock_client, mock_dm) 반환. fetch_user → dm 체인 설정."""
-    client = AsyncMock()
-    dm = AsyncMock()
-    discord_user = AsyncMock()
-    discord_user.create_dm.return_value = dm
-    client.fetch_user.return_value = discord_user
-    return client, dm
 
 
 # ── format_job_message ─────────────────────────────────────────────────────
@@ -97,6 +70,20 @@ def test_low_fit_score_grey_color():
 
 def test_embed_title_bracket_format():
     embed, _ = format_job_message(_make_job(), _make_score())
+    assert embed.title == "[Acme] Backend Dev"
+
+
+def test_embed_title_uses_scored_position_instead_of_posting_title():
+    """제목은 공고명이 아니라 채점에서 고른 직무명 — 직무가 여러 개인 공고에서 어느 직무 기준인지 보이게."""
+    job = _make_job(jd_summary={"employment_type": "정규직"})
+    job.title = "애경그룹｜AK아이에스 2027년 신입사원 공개 채용"
+    job.company = "애경그룹"
+    embed, _ = format_job_message(job, _make_score(position="IT 서비스 개발"))
+    assert embed.title == "[애경그룹] IT 서비스 개발 (정규직)"
+
+
+def test_embed_title_falls_back_to_posting_title_without_position():
+    embed, _ = format_job_message(_make_job(), _make_score(position=""))
     assert embed.title == "[Acme] Backend Dev"
 
 
@@ -163,124 +150,202 @@ def test_tasks_field_omitted_without_summary():
     assert "💼 하는 일" not in field_names
 
 
+def test_card_body_is_only_tasks_and_reasons():
+    """2026-10-15 결정: 카드 본문은 하는 일 + 왜 나랑 맞나만. 자격요건·우대·스택은 [자세히 보기]로."""
+    job = _make_job(jd_summary={
+        "tasks": ["RAG 파이프라인 구축"],
+        "stack": ["Python", "LangGraph"],
+        "qualifications": ["경력 0~3년"],
+        "preferred": ["LangGraph 경험"],
+    })
+    embed, _ = format_job_message(job, _make_score())
+    assert [f.name for f in embed.fields] == ["💼 하는 일", "✨ 왜 나랑 맞나"]
+
+
 def test_company_score_not_in_card():
-    """회사 점수는 카드가 아니라 [상세 분석]에서만 보여준다."""
+    """company_score는 비활성화 상태라 카드에 안 나온다."""
     embed, _ = format_job_message(_make_job(), _make_score(company_score=72))
     field_names = [f.name for f in embed.fields]
     assert "회사 점수" not in field_names
     assert "72" not in (embed.description or "")
 
 
-def test_buttons_have_correct_custom_ids():
+def test_buttons_are_view_details_add_to_list_and_pass():
     job = _make_job(job_id=7)
     score = _make_score(user_id=42)
     _, view = format_job_message(job, score)
     buttons = [c for c in view.children if isinstance(c, discord.ui.Button)]
     assert len(buttons) == 3
-    custom_ids = {b.custom_id for b in buttons}
-    assert "detail:7:42" in custom_ids
-    assert "draft:7:42" in custom_ids
-    assert "dislike:7:42" in custom_ids
+
+    detail = next(b for b in buttons if b.label == "자세히 보기")
+    assert detail.style == discord.ButtonStyle.link
+    assert detail.url == job.url
+    assert detail.custom_id is None  # 링크 버튼은 인터랙션이 안 옴
+
+    custom_ids = {b.custom_id for b in buttons if b.custom_id}
+    assert custom_ids == {"will_apply:7:42", "dislike:7:42"}
 
 
-# ── send_daily_notifications ───────────────────────────────────────────────
+# ── send_daily_notifications: 매칭 채널 ──────────────────────────────────────
+
+CHANNEL_ID = 555
+
+
+def _settings(channel_id=CHANNEL_ID) -> MagicMock:
+    settings = MagicMock()
+    settings.discord.match_channel_id = channel_id
+    settings.discord.bot_token.get_secret_value.return_value = "token"
+    return settings
+
+
+def _discord(sent: list):
+    """(client, channel, message). 채널·스레드로 보낸 내용은 sent에 ("channel"|"thread", kwargs)로 쌓인다."""
+    thread = MagicMock()
+
+    async def thread_send(content=None, **kwargs):
+        sent.append(("thread", {"content": content, **kwargs}))
+
+    thread.send = AsyncMock(side_effect=thread_send)
+    message = MagicMock()
+    message.create_thread = AsyncMock(return_value=thread)
+
+    async def channel_send(content=None, **kwargs):
+        sent.append(("channel", {"content": content, **kwargs}))
+        return message
+
+    channel = MagicMock()
+    channel.send = AsyncMock(side_effect=channel_send)
+    client = AsyncMock()
+    client.fetch_channel.return_value = channel
+    return client, channel, message
+
+
+def _seed(session, scores: list[tuple[int, str]], scored_at=None) -> User:
+    """(점수, 회사) 목록으로 공고·점수를 만든다. 직무명은 '직무-회사'."""
+    user = User(username="tester", is_active=True)
+    session.add(user)
+    session.flush()
+    for i, (fit, company) in enumerate(scores):
+        job = Job(source="a", url=f"https://ex.com/{i}", title=f"공고 {company}", company=company)
+        session.add(job)
+        session.flush()
+        row = JobScore(job_id=job.id, user_id=user.id, fit_score=fit, fit_reasons="이유",
+                       fit_detail={"position": f"직무-{company}"})
+        if scored_at is not None:
+            row.scored_at = scored_at
+        session.add(row)
+    session.commit()
+    return user
+
+
+async def _run(session, sent, settings=None):
+    client, channel, message = _discord(sent)
+    with patch("bot.notifications.get_session", return_value=session), \
+         patch("bot.notifications.get_settings", return_value=settings or _settings()), \
+         patch("bot.notifications.discord.Client", return_value=client):
+        await send_daily_notifications()
+    return client, channel, message
+
+
+def _cards(sent) -> list:
+    return [kw["embed"] for where, kw in sent if kw.get("embed")]
+
 
 @pytest.mark.asyncio
-async def test_notify_no_active_users_sends_no_dm():
-    """활성 유저 없으면 fetch_user를 호출하지 않는다."""
-    session = _make_notify_session(users=[], scores=[])
-    client, dm = _make_discord_mock()
+async def test_notify_posts_header_and_top3_cards_to_match_channel(session):
+    _seed(session, [(90, "A"), (85, "B"), (80, "C")])
+    sent = []
+    client, _, message = await _run(session, sent)
 
-    with patch("bot.notifications.get_session", return_value=session), \
-         patch("bot.notifications.discord.Client") as MockClient:
-        MockClient.return_value = client
-        await send_daily_notifications()
-
-    client.fetch_user.assert_not_called()
-    client.close.assert_called_once()
+    client.fetch_channel.assert_awaited_once_with(CHANNEL_ID)
+    assert sent[0][0] == "channel" and "추천 공고 — 3건" in sent[0][1]["content"]
+    assert [e.title for e in _cards(sent)] == ["[A] 직무-A", "[B] 직무-B", "[C] 직무-C"]
+    message.create_thread.assert_not_called()  # 나머지가 없으면 스레드도 없음
+    client.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_notify_no_qualifying_scores_sends_no_dm():
-    """fit_score 미충족 공고만 있는 유저에게 DM을 보내지 않는다."""
-    user = MagicMock(spec=User)
-    user.id = 1
-    user.discord_id = "111222333"
+async def test_notify_puts_the_rest_in_a_thread_as_one_line_links(session):
+    _seed(session, [(95, "A"), (90, "B"), (85, "C"), (82, "D"), (70, "E")])
+    sent = []
+    _, _, message = await _run(session, sent)
 
-    session = _make_notify_session(users=[user], scores=[])
-    client, dm = _make_discord_mock()
-
-    with patch("bot.notifications.get_session", return_value=session), \
-         patch("bot.notifications.discord.Client") as MockClient:
-        MockClient.return_value = client
-        await send_daily_notifications()
-
-    client.fetch_user.assert_not_called()
+    assert len(_cards(sent)) == 3
+    assert any(where == "channel" and "나머지 2건" in (kw["content"] or "") for where, kw in sent)
+    message.create_thread.assert_awaited_once()
+    thread_text = "\n".join(kw["content"] for where, kw in sent if where == "thread")
+    assert "• [D — 직무-D](https://ex.com/3) · 82점" in thread_text
+    assert "• [E — 직무-E](https://ex.com/4) · 70점" in thread_text
+    assert all(kw.get("suppress_embeds") for where, kw in sent if where == "thread")
 
 
 @pytest.mark.asyncio
-async def test_notify_sends_header_plus_one_embed_per_score():
-    """헤더 1번 + 공고 N건만큼 dm.send를 호출한다."""
-    user = MagicMock(spec=User)
-    user.id = 1
-    user.discord_id = "111222333"
+async def test_notify_only_includes_scores_made_today_and_above_minimum(session):
+    """이틀 전에 채점된 공고는 이미 알림으로 나갔다 — 오늘(KST 0시 이후) 채점된 것만 보낸다."""
+    old = datetime.now(timezone.utc) - timedelta(days=2)
+    user = _seed(session, [(99, "OLD")], scored_at=old)
+    new = Job(source="a", url="https://ex.com/new", title="t", company="NEW")
+    low = Job(source="a", url="https://ex.com/low", title="t", company="LOW")
+    session.add_all([new, low])
+    session.flush()
+    session.add_all([
+        JobScore(job_id=new.id, user_id=user.id, fit_score=80, fit_detail={"position": "p"}),
+        JobScore(job_id=low.id, user_id=user.id, fit_score=MIN_FIT_SCORE - 1),
+    ])
+    session.commit()
+    sent = []
+    await _run(session, sent)
 
-    job = _make_job(job_id=10)
-    score1 = _make_score(fit_score=90, user_id=1)
-    score1.job = job
-    score2 = _make_score(fit_score=80, user_id=1)
-    score2.job = job
-
-    session = _make_notify_session(users=[user], scores=[score1, score2])
-    client, dm = _make_discord_mock()
-
-    with patch("bot.notifications.get_session", return_value=session), \
-         patch("bot.notifications.discord.Client") as MockClient:
-        MockClient.return_value = client
-        await send_daily_notifications()
-
-    # 헤더 1회 + 공고 2건 = 3회
-    assert dm.send.call_count == 3
-    client.close.assert_called_once()
+    assert [e.title for e in _cards(sent)] == ["[NEW] p"]
 
 
 @pytest.mark.asyncio
-async def test_notify_continues_if_one_user_dm_fails():
-    """한 유저의 DM 전송 실패가 다른 유저 처리를 막지 않는다."""
-    user1 = MagicMock(spec=User)
-    user1.id = 1
-    user1.discord_id = "111"
+async def test_notify_says_so_when_no_new_recommendations(session):
+    _seed(session, [(MIN_FIT_SCORE - 10, "A")])
+    sent = []
+    await _run(session, sent)
 
-    user2 = MagicMock(spec=User)
-    user2.id = 2
-    user2.discord_id = "222"
+    assert len(sent) == 1
+    assert "추천 공고 없음" in sent[0][1]["content"]
 
-    job = _make_job(job_id=10)
-    score = _make_score(fit_score=90, user_id=1)
-    score.job = job
 
-    session = _make_notify_session(users=[user1, user2], scores=[score])
-    client, dm = _make_discord_mock()
+@pytest.mark.asyncio
+async def test_notify_skips_without_channel_id_and_does_not_log_in(session):
+    _seed(session, [(90, "A")])
+    sent = []
+    client, _, _ = await _run(session, sent, settings=_settings(channel_id=None))
 
-    fetch_count = {"n": 0}
+    client.login.assert_not_called()
+    assert sent == []
 
-    async def fetch_user_side_effect(discord_id: int):
-        fetch_count["n"] += 1
-        if fetch_count["n"] == 1:
-            raise RuntimeError("봇 차단됨")
-        discord_user = AsyncMock()
-        discord_user.create_dm.return_value = dm
-        return discord_user
 
-    client.fetch_user.side_effect = fetch_user_side_effect
+@pytest.mark.asyncio
+async def test_notify_orders_by_fit_score_then_deadline_within_similar_tier(session):
+    """fit_score가 우선이고, 점수가 비슷한(10점 단위 동일 구간) 것끼리만 마감 가까운 순으로 재정렬한다."""
+    now = datetime.now(timezone.utc)
+    user = User(username="tester")
+    session.add(user)
+    session.flush()
 
-    with patch("bot.notifications.get_session", return_value=session), \
-         patch("bot.notifications.discord.Client") as MockClient:
-        MockClient.return_value = client
-        await send_daily_notifications()
+    # 90점대 둘(마감만 다름) + 60점대 하나(마감이 제일 가까워도 점수 구간이 낮아 후순위)
+    high_far = Job(source="inthiswork", url="https://ex.com/high-far", title="High/Far",
+                   company="A", deadline=now + timedelta(days=20))
+    high_soon = Job(source="inthiswork", url="https://ex.com/high-soon", title="High/Soon",
+                    company="B", deadline=now + timedelta(days=1))
+    low_soonest = Job(source="inthiswork", url="https://ex.com/low-soonest", title="Low/Soonest",
+                      company="C", deadline=now + timedelta(hours=1))
+    session.add_all([high_far, high_soon, low_soonest])
+    session.flush()
+    session.add(JobScore(job_id=high_far.id, user_id=user.id, fit_score=95))
+    session.add(JobScore(job_id=high_soon.id, user_id=user.id, fit_score=91))
+    session.add(JobScore(job_id=low_soonest.id, user_id=user.id, fit_score=60))
+    session.commit()
 
-    # 두 유저 모두 시도
-    assert client.fetch_user.call_count == 2
-    # 두 번째 유저는 성공 → 헤더 + 공고 1건 = 2회 send
-    assert dm.send.call_count == 2
-    client.close.assert_called_once()
+    sent = []
+    await _run(session, sent)
+
+    assert [e.url for e in _cards(sent)] == [
+        "https://ex.com/high-soon",   # 90점대끼리는 마감 가까운 쪽이 먼저
+        "https://ex.com/high-far",    # 같은 90점대, 마감 먼 쪽
+        "https://ex.com/low-soonest", # 마감은 제일 급해도 점수 구간(60점대)이 낮아 마지막
+    ]

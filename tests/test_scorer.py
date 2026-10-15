@@ -4,13 +4,11 @@ from unittest.mock import MagicMock, patch
 from analysis.scorer import (
     score_company_from_dart,
     score_company_from_llm,
-    score_fit,
-    score_job_for_user,
     summarize_jd,
 )
 
 
-# ── score_fit (LLM mock) ────────────────────────────────────────────────
+# ── LLM mock (score_fit 테스트는 tests/test_fit_scoring.py) ───────────────
 
 def _mock_fit_chain(content: str) -> MagicMock:
     resp = MagicMock()
@@ -18,33 +16,6 @@ def _mock_fit_chain(content: str) -> MagicMock:
     chain = MagicMock()
     chain.invoke.return_value = resp
     return chain
-
-
-def test_score_fit_returns_valid_range():
-    chain = _mock_fit_chain('{"fit_score": 82, "fit_reasons": "Python 경험 일치"}')
-    with patch("analysis.scorer.build_fit_chain", return_value=chain):
-        result = score_fit(
-            jd_text="Python 백엔드 개발자. AWS 우대.",
-            resume_text="Python 3년, FastAPI, AWS Lambda 경험.",
-            experience_text="스타트업 결제 시스템 개발.",
-        )
-    assert 0 <= result["fit_score"] <= 100
-    assert isinstance(result["fit_reasons"], str)
-    assert len(result["fit_reasons"]) > 0
-
-
-def test_score_fit_handles_malformed_json():
-    chain = _mock_fit_chain("분석할 수 없습니다.")
-    with patch("analysis.scorer.build_fit_chain", return_value=chain):
-        result = score_fit(jd_text="", resume_text="", experience_text="")
-    assert result["fit_score"] == 0
-
-
-def test_score_fit_clamps_over_100():
-    chain = _mock_fit_chain('{"fit_score": 150, "fit_reasons": "완벽"}')
-    with patch("analysis.scorer.build_fit_chain", return_value=chain):
-        result = score_fit("jd", "resume", "exp")
-    assert result["fit_score"] == 100
 
 
 # ── score_company_from_dart (규칙 기반) ─────────────────────────────────
@@ -111,81 +82,18 @@ def test_llm_company_score_malformed_fallback():
     assert 0 <= score <= 100  # 기본값 50
 
 
-# ── score_job_for_user (통합) ────────────────────────────────────────────
-
-def test_score_job_uses_dart_when_available():
-    """DART 데이터 있으면 dart 경로 사용."""
-    fit_chain = _mock_fit_chain('{"fit_score": 75, "fit_reasons": "적합"}')
-    mock_dart = MagicMock()
-    mock_dart.get_company_data.return_value = {
-        "op_profit": 1_000_000_000,
-        "debt_ratio": 90.0,
-        "employees": 150,
-        "revenue": 20_000_000_000,
-    }
-
-    with patch("analysis.scorer.build_fit_chain", return_value=fit_chain):
-        result = score_job_for_user(
-            jd_text="JD",
-            company="테스트 주식회사",
-            resume_text="이력서",
-            experience_text="경험",
-            dart_client=mock_dart,
-        )
-
-    assert result["fit_score"] == 75
-    assert 0 <= result["company_score"] <= 100
-    assert "[추정]" not in result["company_summary"]  # DART 경로 (추정 표시 없음)
-
-
-def test_score_job_falls_back_to_llm_when_dart_missing():
-    """DART에서 회사 못 찾으면 LLM fallback."""
-    fit_chain = _mock_fit_chain('{"fit_score": 60, "fit_reasons": "보통"}')
-    company_chain = MagicMock()
-    company_chain.invoke.return_value = MagicMock(
-        content='{"company_score": 55, "company_summary": "중간 수준"}'
-    )
-    mock_dart = MagicMock()
-    mock_dart.get_company_data.return_value = None  # 미등록
-
-    with patch("analysis.scorer.build_fit_chain", return_value=fit_chain), \
-         patch("analysis.scorer.build_company_chain", return_value=company_chain):
-        result = score_job_for_user(
-            jd_text="JD",
-            company="미등록스타트업",
-            resume_text="이력서",
-            experience_text="경험",
-            dart_client=mock_dart,
-        )
-
-    assert "[추정]" in result["company_summary"]  # LLM fallback 표시
-
-
-def test_score_job_no_dart_client_uses_llm():
-    """dart_client=None이면 바로 LLM fallback."""
-    fit_chain = _mock_fit_chain('{"fit_score": 50, "fit_reasons": "보통"}')
-    company_chain = MagicMock()
-    company_chain.invoke.return_value = MagicMock(
-        content='{"company_score": 60, "company_summary": "괜찮음"}'
-    )
-
-    with patch("analysis.scorer.build_fit_chain", return_value=fit_chain), \
-         patch("analysis.scorer.build_company_chain", return_value=company_chain):
-        result = score_job_for_user(
-            jd_text="JD", company="회사", resume_text="", experience_text="",
-            dart_client=None,
-        )
-
-    assert "[추정]" in result["company_summary"]
-
-
 # ── summarize_jd (LLM mock) ─────────────────────────────────────────────
+
+_EMPTY_ELIGIBILITY = {"new_grad_ok": None, "min_years": None, "evidence": ""}
+
 
 def test_summarize_jd_parses_full_response():
     chain = _mock_fit_chain(
         '{"tasks": ["RAG 구축", "Agent 설계"], "stack": ["Python", "LangGraph"],'
         ' "employment_type": "정규직", "qualifications": ["경력 0~3년", "Python 능숙"],'
-        ' "preferred": ["LangGraph 경험"]}'
+        ' "preferred": ["LangGraph 경험"],'
+        ' "eligibility": {"new_grad_ok": true, "min_years": null, "evidence": "신입 지원 가능 명시"},'
+        ' "locations": ["서울 강남구", "경기 성남시 분당구 판교역로"]}'
     )
     with patch("analysis.scorer.build_summary_chain", return_value=chain):
         result = summarize_jd("긴 JD 텍스트")
@@ -195,12 +103,16 @@ def test_summarize_jd_parses_full_response():
     assert result["employment_type"] == "정규직"
     assert result["qualifications"] == ["경력 0~3년", "Python 능숙"]
     assert result["preferred"] == ["LangGraph 경험"]
+    assert result["eligibility"] == {
+        "new_grad_ok": True, "min_years": None, "evidence": "신입 지원 가능 명시",
+    }
+    assert result["locations"] == ["서울 강남구", "경기 성남시 분당구 판교역로"]
 
 
 def test_summarize_jd_caps_tasks_at_four():
     chain = _mock_fit_chain(
         '{"tasks": ["a", "b", "c", "d", "e", "f"], "stack": [],'
-        ' "employment_type": "", "qualifications": [], "preferred": []}'
+        ' "employment_type": "", "qualifications": [], "preferred": [], "eligibility": {}}'
     )
     with patch("analysis.scorer.build_summary_chain", return_value=chain):
         result = summarize_jd("JD")
@@ -215,5 +127,77 @@ def test_summarize_jd_malformed_returns_empty_structure():
 
     assert result == {
         "tasks": [], "stack": [], "employment_type": "",
-        "qualifications": [], "preferred": [],
+        "qualifications": [], "preferred": [], "eligibility": _EMPTY_ELIGIBILITY,
+        "locations": [],
     }
+
+
+def test_summarize_jd_missing_eligibility_key_defaults_to_empty():
+    """eligibility 키 자체가 없는 응답(구버전 프롬프트 캐시 등)도 안전하게 처리한다."""
+    chain = _mock_fit_chain(
+        '{"tasks": [], "stack": [], "employment_type": "", "qualifications": [], "preferred": []}'
+    )
+    with patch("analysis.scorer.build_summary_chain", return_value=chain):
+        result = summarize_jd("JD")
+
+    assert result["eligibility"] == _EMPTY_ELIGIBILITY
+    assert result["locations"] == []  # 근무지 필드가 없던 구버전 응답도 빈 목록
+
+
+def test_summarize_jd_eligibility_with_wrong_types_falls_back():
+    """new_grad_ok/min_years가 기대 타입이 아니면(문자열 등) None으로 안전 처리한다."""
+    chain = _mock_fit_chain(
+        '{"tasks": [], "stack": [], "employment_type": "", "qualifications": [], "preferred": [],'
+        ' "eligibility": {"new_grad_ok": "아마도", "min_years": "3년", "evidence": "불명확"}}'
+    )
+    with patch("analysis.scorer.build_summary_chain", return_value=chain):
+        result = summarize_jd("JD")
+
+    assert result["eligibility"] == {"new_grad_ok": None, "min_years": None, "evidence": "불명확"}
+
+
+def test_summarize_jd_without_hints_still_works():
+    """hints를 안 주면(기본값) 힌트 없이 요청한다 — 기존 호출부 하위호환."""
+    chain = _mock_fit_chain(
+        '{"tasks": [], "stack": [], "employment_type": "", "qualifications": [], "preferred": [], "eligibility": {}}'
+    )
+    with patch("analysis.scorer.build_summary_chain", return_value=chain):
+        result = summarize_jd("JD")  # hints 인자 생략
+
+    assert result["eligibility"] == _EMPTY_ELIGIBILITY
+
+
+def test_summarize_jd_passes_career_level_hints_into_prompt():
+    """hints.positions의 career_level을 프롬프트 입력(hints_text)으로 넘긴다."""
+    chain = _mock_fit_chain(
+        '{"tasks": [], "stack": [], "employment_type": "", "qualifications": [], "preferred": [], "eligibility": {}}'
+    )
+    with patch("analysis.scorer.build_summary_chain", return_value=chain):
+        summarize_jd("JD", hints={"positions": [{"career_level": "신입"}, {"career_level": "신입/인턴"}]})
+
+    invoked_with = chain.invoke.call_args[0][0]
+    assert invoked_with["hints_text"] == "신입, 신입/인턴"
+
+
+def test_summarize_jd_empty_hints_produces_placeholder_text():
+    chain = _mock_fit_chain(
+        '{"tasks": [], "stack": [], "employment_type": "", "qualifications": [], "preferred": [], "eligibility": {}}'
+    )
+    with patch("analysis.scorer.build_summary_chain", return_value=chain):
+        summarize_jd("JD", hints=None)
+
+    invoked_with = chain.invoke.call_args[0][0]
+    assert invoked_with["hints_text"] == "(없음)"
+
+
+# ── Gemini 3 응답 형식: content가 블록 목록 (2026-10-14 실제 실행에서 발견) ──────────
+
+def test_summarize_jd_joins_multiple_text_blocks_and_skips_non_text():
+    chain = _mock_fit_chain([
+        {"type": "thinking", "thinking": "{\"tasks\": [\"가짜\"]}"},
+        {"type": "text", "text": '{"tasks": ["RAG 구축"], "stack": [],'},
+        {"type": "text", "text": ' "employment_type": "", "qualifications": [], "preferred": []}'},
+    ])
+    with patch("analysis.scorer.build_summary_chain", return_value=chain):
+        result = summarize_jd("JD")
+    assert result["tasks"] == ["RAG 구축"]

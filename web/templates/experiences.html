@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}경험 조각 관리 — MatchWise{% endblock %}
+{% block content %}
+<h2>경력·자기소개서 조각 관리</h2>
+<p style="color:#6b7280; font-size:0.9rem;">
+  문서를 통째로 쓰는 대신, 자소서에 재사용할 경험을 조각 단위로 저장합니다.
+  지원서 작성 페이지에서 이 조각들을 근거로 초안이 생성됩니다.
+</p>
+<div class="card">
+  <h3>{{ current_user.username }}</h3>
+
+  <details>
+    <summary>기본 정보</summary>
+    <form method="post" action="/experiences/basic-info" style="margin-top:0.5rem;">
+      <label>이름 <input type="text" name="name" value="{{ (current_user.basic_info or {}).get('이름', '') }}"></label>
+      <label>학력 <input type="text" name="education" value="{{ (current_user.basic_info or {}).get('학력', '') }}"></label>
+      <button class="btn" type="submit">저장</button>
+    </form>
+  </details>
+
+  <details open>
+    <summary>경험 조각 ({{ experiences | length }}개)</summary>
+    <table>
+      <thead><tr><th>종류</th><th>제목</th><th>기간</th><th>태그</th><th></th></tr></thead>
+      <tbody>
+        {% set kind_labels = {"career": "경력", "project": "프로젝트", "award": "수상", "campus": "교내활동", "club": "동아리", "team_project": "팀프로젝트·공모전", "education": "교육이수", "volunteer": "봉사", "story": "에피소드"} %}
+        {% for exp in experiences %}
+        <tr>
+          <td>{{ kind_labels.get(exp.kind, exp.kind) }}</td>
+          <td>{{ exp.title }}</td>
+          <td>{{ exp.period }}</td>
+          <td>{% for t in (exp.tags or []) %}<span class="tag">{{ t }}</span>{% endfor %}</td>
+          <td>
+            <form method="post" action="/experiences/{{ exp.id }}/delete" style="display:inline;">
+              <button class="btn secondary" type="submit" onclick="return confirm('삭제할까요?')">삭제</button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5">아직 등록된 경험이 없습니다.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <form method="post" action="/experiences/add" style="margin-top:1rem;">
+      <select name="kind">
+        <option value="career">경력</option>
+        <option value="project">프로젝트</option>
+        <option value="story">에피소드</option>
+      </select>
+      <input type="text" name="title" placeholder="제목">
+      <input type="text" name="period" placeholder="기간 (예: 2024.03~2024.08)">
+      <input type="text" name="tags" placeholder="태그 (쉼표로 구분)">
+      <textarea name="content" rows="4" placeholder="내용" required></textarea>
+      <button class="btn" type="submit">추가</button>
+    </form>
+  </details>
+</div>
+{% endblock %}

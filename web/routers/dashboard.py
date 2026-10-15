@@ -7,7 +7,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from db.orm import ApplicationQuestion, Job, JobScore, User
-from web.deps import get_db
+from web.deps import get_current_user, get_db
 
 router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).parent.parent / "templates"))
@@ -17,11 +17,15 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent.parent / "templa
 def dashboard(
     request: Request,
     source: str | None = None,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     query = (
         db.query(Job, JobScore)
-        .outerjoin(JobScore, Job.id == JobScore.job_id)
+        .outerjoin(
+            JobScore,
+            (Job.id == JobScore.job_id) & (JobScore.user_id == current_user.id),
+        )
     )
     if source:
         query = query.filter(Job.source == source)
@@ -31,18 +35,25 @@ def dashboard(
 
     return templates.TemplateResponse(
         "dashboard.html",
-        {"request": request, "jobs": rows, "sources": sources, "active_source": source},
+        {
+            "request": request, "jobs": rows, "sources": sources,
+            "active_source": source, "current_user": current_user,
+        },
     )
 
 
 @router.get("/jobs/{job_id}", response_class=HTMLResponse)
-def job_detail(request: Request, job_id: int, db: Session = Depends(get_db)):
+def job_detail(
+    request: Request,
+    job_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     job = db.query(Job).filter_by(id=job_id).first()
-    scores = (
-        db.query(JobScore, User)
-        .join(User, User.id == JobScore.user_id)
-        .filter(JobScore.job_id == job_id)
-        .all()
+    score = (
+        db.query(JobScore)
+        .filter_by(job_id=job_id, user_id=current_user.id)
+        .first()
     )
     questions = (
         db.query(ApplicationQuestion)
@@ -50,15 +61,22 @@ def job_detail(request: Request, job_id: int, db: Session = Depends(get_db)):
         .order_by(ApplicationQuestion.order_num)
         .all()
     )
-    summary = job.jd_summary if job and isinstance(job.jd_summary, dict) else {}
+    summary = {
+        "tasks": job.jd_tasks,
+        "stack": job.jd_stack,
+        "employment_type": job.jd_employment_type,
+        "qualifications": job.jd_qualifications,
+        "preferred": job.jd_preferred,
+    } if job else {}
     return templates.TemplateResponse(
         "jobs_detail.html",
         {
             "request": request,
             "job": job,
             "summary": summary,
-            "scores": scores,
+            "score": score,
             "questions": questions,
+            "current_user": current_user,
         },
     )
 
@@ -67,6 +85,7 @@ def job_detail(request: Request, job_id: int, db: Session = Depends(get_db)):
 def save_questions(
     job_id: int,
     questions: str = Form(...),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """textarea 한 줄 = 질문 하나. 저장 시 기존 질문을 덮어쓴다."""

@@ -31,22 +31,20 @@
 </div>
 {% endif %}
 
-<h3>유저별 적합도</h3>
+<h3>내 적합도</h3>
+{% if score %}
 <table>
-  <thead><tr><th>유저</th><th>적합도</th><th>기업점수</th><th>매칭 이유</th></tr></thead>
+  <thead><tr><th>적합도</th><th>매칭 이유</th></tr></thead>
   <tbody>
-    {% for score, user in scores %}
     <tr>
-      <td>{{ user.username }}</td>
       <td>{{ score.fit_score }}</td>
-      <td>{{ score.company_score }}</td>
       <td>{{ score.fit_reasons }}</td>
     </tr>
-    {% else %}
-    <tr><td colspan="4">아직 분석되지 않았습니다.</td></tr>
-    {% endfor %}
   </tbody>
 </table>
+{% else %}
+<p style="color:#6b7280;">아직 분석되지 않았습니다.</p>
+{% endif %}
 
 <h3>JD 원문</h3>
 <pre style="white-space:pre-wrap; border:1px solid #e5e7eb; padding:1rem; border-radius:4px;">{{ job.jd_text }}</pre>

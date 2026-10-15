@@ -17,6 +17,10 @@ DEVELOPMENT_CHECKLIST.md
 credentials.json
 token.json
 
+# GCP 서비스 계정 키 (Document AI 테스트 등)
+.gcp/
+*-service-account.json
+
 # 개인 데이터
 profile.json
 3월_실습일지.md

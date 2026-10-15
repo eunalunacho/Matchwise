@@ -34,10 +34,18 @@
   </style>
 </head>
 <body>
+  {% if current_user %}
   <nav>
     <a href="/dashboard">대시보드</a>
     <a href="/profile">프로필 관리</a>
+    <a href="/experiences">경험 조각 관리</a>
+    <span style="margin-left:auto; color:#6b7280; font-size:0.85rem;">
+      {{ current_user.username }}
+      {%- if not current_user.discord_id %} · <a href="/connect/discord">Discord 연결</a>{% endif %}
+      · <a href="/logout">로그아웃</a>
+    </span>
   </nav>
+  {% endif %}
   {% block content %}{% endblock %}
 </body>
 </html>

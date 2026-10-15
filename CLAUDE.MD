@@ -9,7 +9,7 @@
 
 ## 아키텍처 요약 (상세는 DESIGN.md)
 
-- **Layer 1 파이프라인**: `scheduler`(APScheduler) → `crawler`(02시) → `analysis`(05시, Gemini) → `bot` 알림(09시). 일반 코드 — 에이전트 아님.
+- **Layer 1 파이프라인**: `scheduler`(APScheduler) → `run_crawl_pipeline`(02시, `crawl_job`→`extract_job` 체인, OCR 포함) → `analyze_job`(05시, Gemini) → `bot` 알림(09시). 일반 코드 — 에이전트 아님.
 - **Layer 2 지원 관리**: `applications` 상태머신(interested→will_apply→submitted→…) + Discord 버튼 + 재촉/리마인드 잡. LLM 불필요.
 - **Layer 3 에이전트**: `memory/`(위키·GitHub ingest → pgvector RAG), `draft/`(LangGraph 초안 생성, Claude Pro OAuth). 포트폴리오 코어.
 
@@ -18,16 +18,18 @@
 ## 디렉토리
 
 ```
-crawler/    사이트별 크롤러 (클래스 기반: InthisworkCrawler, SuperookieCrawler)
+crawler/    사이트별 크롤러 (BaseCrawler → RawJob. InthisworkCrawler, JasoseolCrawler, JobkoreaCrawler — HTTP만, 브라우저 없음)
 analysis/   scorer, gemini_client, dart_client
-scheduler/  APScheduler 잡 정의 (jobs.py) + 엔트리 (main.py)
+scheduler/  APScheduler 잡 정의 (jobs.py — 수집 사이트 on/off는 _enabled_crawlers() 한 곳) + 엔트리 (main.py)
 bot/        discord.py — notifications, interactions(버튼 핸들러)
 db/         SQLAlchemy ORM (orm.py), init_db
+web/        FastAPI + Jinja2 — routers(auth, dashboard, draft, experiences, profile), templates
 shared/     config, logger, db 세션
-memory/     (Phase D~) Memory Agent — 독립 추출 가능한 구조 유지
-draft/      (Phase E~) Draft Agent — LangGraph StateGraph
-scripts/    1회성 스크립트 (import_wiki.py, eval_draft.py 등)
+memory/     (Phase D~, 미생성) Memory Agent — 독립 추출 가능한 구조 유지
+draft/      (Phase E~, 미생성) Draft Agent — LangGraph StateGraph
+scripts/    1회성 스크립트 (add_user.py, migrate_users_columns.py, import_profile.py — profile.json → basic_info·experiences)
 tests/      pytest
+docs/superpowers/specs/  기능별 상세 설계 (JD 저장 설계 등)
 ```
 
 ## 코딩 규칙
@@ -47,6 +49,10 @@ tests/      pytest
 
 ```bash
 docker compose up -d                         # postgres, web-api, bot, scheduler
-docker compose --profile crawl run crawler   # 크롤러 수동 실행
-pytest                                       # 테스트
+.venv/Scripts/python.exe -m pytest           # 테스트 (Windows Git Bash. `uv run`은 경로 문제로 실패할 수 있음)
+# PowerShell에서는 앞에 .\ 필요:  .\.venv\Scripts\python.exe -m pytest
 ```
+
+- 로그: 진입점마다 `shared/logger.py::setup_logging("<프로그램>")` → 콘솔 + `logs/<프로그램>.log`(자정마다 날짜 파일로 넘기고 최근 7일 보관). 모듈에서는 `logging.getLogger(__name__)`만 쓴다.
+- `docker compose --profile crawl run --rm crawler` — 수집→추출(`run_crawl_pipeline`)을 수동으로 1회 실행 (`crawler/main.py`). 평소엔 scheduler가 02시에 같은 함수를 실행한다.
+- 스키마 변경은 `create_all`(db/init_db.py)만으로는 기존 테이블에 컬럼이 추가되지 않는다 — 이미 만들어진 DB에 컬럼을 추가했다면 그 DB에 `ALTER TABLE`을 직접 1회 실행한다(로컬 `matchwise_dev.db`는 2026-10-14 기준 최신 스키마).

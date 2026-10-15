@@ -17,6 +17,5 @@ COPY . .
 CMD ["uv", "run", "python", "-m", "scheduler.main"]
 
 FROM base AS crawler
-RUN uv run playwright install chromium --with-deps
 COPY . .
 CMD ["uv", "run", "python", "-m", "crawler.main"]
