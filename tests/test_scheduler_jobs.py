@@ -624,6 +624,7 @@ def test_ocr_image_document_ai_downloads_and_calls_processor():
         mock_get_settings.return_value.gcp.project_id = "proj"
         mock_get_settings.return_value.gcp.project_location = "us"
         mock_get_settings.return_value.gcp.doc_processor_id = "proc123"
+        mock_get_settings.return_value.gcp.sa_key_json = None
 
         result = _ocr_image_document_ai("https://img.example.com/jd.png")
 
@@ -655,6 +656,7 @@ def test_ocr_image_document_ai_defaults_mime_type_when_header_missing():
         mock_get_settings.return_value.gcp.project_id = "proj"
         mock_get_settings.return_value.gcp.project_location = "us"
         mock_get_settings.return_value.gcp.doc_processor_id = "proc123"
+        mock_get_settings.return_value.gcp.sa_key_json = None
 
         _ocr_image_document_ai("https://img.example.com/jd")
 
@@ -687,6 +689,55 @@ def _fake_docai(texts):
     return client
 
 
+def _adc_settings():
+    """GSA 키 없이 ADC로 인증하는 설정(로컬과 같은 상태)."""
+    settings = MagicMock()
+    settings.gcp.sa_key_json = None
+    return settings
+
+
+def test_document_ai_client_uses_adc_without_sa_key():
+    """GCP_SA_KEY_JSON이 없으면 자격증명을 넘기지 않아 SDK가 ADC(로컬 위장 로그인)를 찾게 한다."""
+    from scheduler.jobs import _document_ai_client
+
+    with patch("scheduler.jobs.documentai.DocumentProcessorServiceClient") as client_cls, \
+         patch("scheduler.jobs.get_settings", return_value=_adc_settings()):
+        _document_ai_client()
+
+    client_cls.assert_called_once_with()
+
+
+def test_document_ai_client_treats_blank_sa_key_as_unset():
+    from pydantic import SecretStr
+    from scheduler.jobs import _document_ai_client
+
+    settings = MagicMock()
+    settings.gcp.sa_key_json = SecretStr("  ")
+    with patch("scheduler.jobs.documentai.DocumentProcessorServiceClient") as client_cls, \
+         patch("scheduler.jobs.get_settings", return_value=settings):
+        _document_ai_client()
+
+    client_cls.assert_called_once_with()
+
+
+def test_document_ai_client_uses_sa_key_json_when_set():
+    """GCP_SA_KEY_JSON(GSA 키 JSON 내용)이 있으면 그 키로 만든 자격증명으로 클라이언트를 만든다 — Railway 운영용."""
+    from pydantic import SecretStr
+    from scheduler.jobs import _document_ai_client
+
+    settings = MagicMock()
+    settings.gcp.sa_key_json = SecretStr('{"type": "service_account", "client_email": "ocr@p.iam.gserviceaccount.com"}')
+    with patch("scheduler.jobs.documentai.DocumentProcessorServiceClient") as client_cls, \
+         patch("scheduler.jobs.service_account.Credentials.from_service_account_info") as from_info, \
+         patch("scheduler.jobs.get_settings", return_value=settings):
+        _document_ai_client()
+
+    from_info.assert_called_once_with(
+        {"type": "service_account", "client_email": "ocr@p.iam.gserviceaccount.com"}
+    )
+    client_cls.assert_called_once_with(credentials=from_info.return_value)
+
+
 def test_ocr_image_document_ai_follows_redirects():
     """이미지 서버가 308 등으로 다른 주소를 알려주면 따라간다 (2026-10-14 kribb.fairy.im 실패 사례)."""
     from scheduler.jobs import _ocr_image_document_ai
@@ -694,7 +745,7 @@ def test_ocr_image_document_ai_follows_redirects():
     fake_response = MagicMock(content=b"fake-image-bytes", headers={"content-type": "image/png"})
     with patch("scheduler.jobs.httpx.get", return_value=fake_response) as mock_get, \
          patch("scheduler.jobs.documentai.DocumentProcessorServiceClient", return_value=_fake_docai(["t"])), \
-         patch("scheduler.jobs.get_settings"):
+         patch("scheduler.jobs.get_settings", return_value=_adc_settings()):
         _ocr_image_document_ai("https://img.example.com/jd.png")
 
     assert mock_get.call_args.kwargs["follow_redirects"] is True
@@ -710,7 +761,7 @@ def test_ocr_image_document_ai_splits_image_taller_than_10k_pixels():
     client = _fake_docai(["첫 조각", "둘째 조각", "셋째 조각"])
     with patch("scheduler.jobs.httpx.get", return_value=fake_response), \
          patch("scheduler.jobs.documentai.DocumentProcessorServiceClient", return_value=client), \
-         patch("scheduler.jobs.get_settings"):
+         patch("scheduler.jobs.get_settings", return_value=_adc_settings()):
         result = _ocr_image_document_ai("https://img.example.com/long.webp")
 
     assert result == "첫 조각\n둘째 조각\n셋째 조각"
@@ -730,7 +781,7 @@ def test_ocr_image_document_ai_sends_image_within_limit_unchanged():
     client = _fake_docai(["본문"])
     with patch("scheduler.jobs.httpx.get", return_value=fake_response), \
          patch("scheduler.jobs.documentai.DocumentProcessorServiceClient", return_value=client), \
-         patch("scheduler.jobs.get_settings"):
+         patch("scheduler.jobs.get_settings", return_value=_adc_settings()):
         assert _ocr_image_document_ai("https://img.example.com/jd.png") == "본문"
 
     assert client.process_document.call_args.kwargs["request"].raw_document.content == original

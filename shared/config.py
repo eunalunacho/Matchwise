@@ -103,8 +103,11 @@ class GCPSettings(BaseSettings):
     """Google Cloud 설정 — GCP_ 접두사 하나로 통합 (project_id 공통값 + Document AI 리소스 값).
 
     GOOGLE_APPLICATION_CREDENTIALS는 Google SDK가 직접 읽는 표준 환경변수라 여기 필드로 안 두고
-    .env에만 둔다. 지금은 ADC(위장 로그인, `gcloud auth application-default login
+    .env에만 둔다. 로컬은 ADC(위장 로그인, `gcloud auth application-default login
     --impersonate-service-account=...`)를 쓰므로 비워둔다.
+
+    sa_key_json(GCP_SA_KEY_JSON): GSA 키 JSON "내용". GCP 밖이라 ADC가 없는 Railway 운영에서만 넣는다
+    (scheduler 서비스, Seal 처리). 로컬 .env에는 넣지 않는다 — 비어 있으면 ADC를 쓴다.
     """
 
     model_config = SettingsConfigDict(
@@ -117,6 +120,7 @@ class GCPSettings(BaseSettings):
     project_id: str | None = None
     project_location: str = "us"
     doc_processor_id: str | None = None
+    sa_key_json: SecretStr | None = None
 
 
 class DatabaseSettings(BaseSettings):

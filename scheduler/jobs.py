@@ -15,6 +15,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import httpx
 from google.cloud import documentai
+from google.oauth2 import service_account
 from PIL import Image
 from sqlalchemy import and_, or_
 
@@ -329,18 +330,31 @@ def _image_parts_for_document_ai(content: bytes, mime_type: str) -> list[tuple[b
         top = bottom - _OCR_SLICE_OVERLAP_PX
 
 
+def _document_ai_client() -> documentai.DocumentProcessorServiceClient:
+    """Document AI 클라이언트를 만든다.
+
+    GCP_SA_KEY_JSON(GSA 키 JSON 내용)이 있으면 그 키로 인증한다 — GCP 밖이라 ADC가 없는 Railway 운영용
+    (2026-10-23). 없거나 비어 있으면 자격증명을 넘기지 않아 SDK가 ADC(로컬 위장 로그인)를 찾는다.
+    """
+    key_json = get_settings().gcp.sa_key_json
+    if key_json is None or not key_json.get_secret_value().strip():
+        return documentai.DocumentProcessorServiceClient()
+    info = json.loads(key_json.get_secret_value())
+    credentials = service_account.Credentials.from_service_account_info(info)
+    return documentai.DocumentProcessorServiceClient(credentials=credentials)
+
+
 def _ocr_image_document_ai(image_url: str) -> str:
     """이미지 1장을 Google Cloud Document AI로 OCR해 텍스트를 반환한다.
 
-    인증은 ADC(로컬은 위장 로그인, 운영 환경은 별도 결정)를 쓴다 — 이 함수는 자격증명 방식을
-    모르고, DocumentProcessorServiceClient()가 알아서 찾는다. 이미지 주소가 리다이렉트되면 따라가고,
+    인증은 _document_ai_client()가 고른다(운영은 GSA 키, 로컬은 ADC). 이미지 주소가 리다이렉트되면 따라가고,
     10,000px를 넘는 긴 이미지는 조각으로 나눠 OCR한 뒤 줄바꿈으로 이어 붙인다.
     """
     response = httpx.get(image_url, headers=_OCR_HEADERS, timeout=30, follow_redirects=True)
     response.raise_for_status()
 
     settings = get_settings().gcp
-    client = documentai.DocumentProcessorServiceClient()
+    client = _document_ai_client()
     name = client.processor_path(settings.project_id, settings.project_location, settings.doc_processor_id)
     parts = _image_parts_for_document_ai(
         response.content, response.headers.get("content-type") or "image/png",
