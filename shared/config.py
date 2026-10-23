@@ -156,9 +156,7 @@ class ScheduleConfig(BaseModel):
     """스케줄 설정 (KST 기준)."""
 
     cleanup_hour: int = 1
-    crawl_hour: int = 2
-    analyze_hour: int = 5
-    brief_hour: int = 9
+    pipeline_hour: int = 8  # 수집 → 추출 → 채점 → 알림을 이어서 실행 (run_daily_pipeline)
     timezone: str = "Asia/Seoul"
 
 

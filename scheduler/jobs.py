@@ -247,7 +247,7 @@ def _crawl_one_site(session, CrawlerCls: type[BaseCrawler], known_urls: set[str]
 
 
 def crawl_job() -> list[dict]:
-    """신규 공고 수집 후 DB에 저장 (URL 기준 중복 제외). 02:00 KST에 run_crawl_pipeline이 호출한다.
+    """신규 공고 수집 후 DB에 저장 (URL 기준 중복 제외). run_crawl_pipeline이 호출한다(08:00 KST 체인 1단계).
 
     크롤링 전에 기존 URL 전체를 한 번만 조회해 크롤러에 넘긴다 — 각 크롤러는
     이미 아는 URL의 상세 페이지 요청 자체를 생략해 불필요한 스크래핑을 줄인다.
@@ -574,7 +574,7 @@ def _apply_score(row: JobScore, result: dict, user: User, now: datetime) -> None
 
 
 def analyze_job() -> None:
-    """05:00 KST — (Job × User) 조합 fit_score 계산.
+    """08:00 KST 체인 2단계 — (Job × User) 조합 fit_score 계산.
 
     1) 신규: extract_job이 추출을 끝낸(extract_status='ok') 공고 중 _is_scoring_target을 통과했고 아직 점수가 없는
        (공고, 유저) 조합을 채점한다. pending·failed는 카드 내용과 신입 여부를 몰라, needs_ocr/empty는 jd_text가 비어 제외.
@@ -692,7 +692,7 @@ def analyze_job() -> None:
 # ── Job 3: Discord 알림 ──────────────────────────────────────────────────
 
 def notify_job() -> None:
-    """09:00 KST — 유저별 매칭 채널에 아직 안 보낸 추천 공고 발송 (bot/notifications.py)."""
+    """08:00 KST 체인 3단계 — 유저별 매칭 채널에 아직 안 보낸 추천 공고 발송 (bot/notifications.py)."""
     logger.info("[notify] 시작")
     try:
         from bot.notifications import send_daily_notifications
@@ -713,3 +713,17 @@ def assistant_job() -> None:
         logger.info("[assistant] 완료")
     except Exception:
         logger.exception("[assistant] 실패")
+
+
+# ── 하루 1회 체인 ────────────────────────────────────────────────────────
+
+def run_daily_pipeline() -> None:
+    """08:00 KST — 수집·추출 → 채점 → 매칭 알림 → 비서 DM을 한 번에 이어서 실행한다(2026-10-23 결정).
+
+    단계마다 고정 시간에 따로 돌던 것(02·05·09시)을 함수 호출 체인으로 합쳤다. 각 단계는 예외를
+    안에서 처리하고 돌아오므로, 수집이 멈춰도 이미 쌓인 공고로 채점·알림은 그대로 진행된다.
+    """
+    run_crawl_pipeline()
+    analyze_job()
+    notify_job()
+    assistant_job()

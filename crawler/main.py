@@ -4,8 +4,8 @@ docker-compose의 crawler 서비스(profile: crawl)가 이 모듈을 실행한�
   docker compose --profile crawl run --rm crawler
   CMD ["uv", "run", "python", "-m", "crawler.main"]
 
-스케줄러 02시 잡과 같은 run_crawl_pipeline(crawl_job → extract_job)을 호출한다 —
-수집만 하고 추출을 빼면 새 공고가 다음 02시까지 extract_status='pending'으로 남기 때문이다.
+스케줄러 08시 체인(run_daily_pipeline)의 첫 단계와 같은 run_crawl_pipeline(crawl_job → extract_job)을 호출한다 —
+수집만 하고 추출을 빼면 새 공고가 다음 08시까지 extract_status='pending'으로 남기 때문이다.
 """
 import logging
 

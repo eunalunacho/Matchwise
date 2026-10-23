@@ -10,7 +10,7 @@
 **3-레이어 구조** ([DESIGN.md](DESIGN.md) 상세):
 
 ```
-Layer 1  파이프라인   02시 수집→추출(OCR 포함) → 05시 fit 분석(Gemini) → 09시 Discord 알림
+Layer 1  파이프라인   08시 수집→추출(OCR 포함) → fit 분석(Gemini) → Discord 알림 (한 번에 이어서 실행)
 Layer 2  지원 관리    [목록에 등록][패스] 버튼 → 상태 추적 → 채널 현황 공유·마감 리마인드
 Layer 3  에이전트     개인 위키·GitHub → 기억저장소(pgvector) → RAG 기반 초안 생성(LangGraph + Claude)
 ```

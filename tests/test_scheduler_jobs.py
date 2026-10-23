@@ -14,7 +14,7 @@ from db.orm import (
 )
 from scheduler.jobs import (
     _GEMINI_DAILY_CAP, _is_scoring_target, _retry_window_start, cleanup_job, crawl_job, extract_job,
-    analyze_job, run_crawl_pipeline,
+    analyze_job, run_crawl_pipeline, run_daily_pipeline,
 )
 
 
@@ -1068,6 +1068,34 @@ def test_run_crawl_pipeline_reports_error_when_extract_fails():
 
     assert len(sent) == 3
     assert sent[-1] == "❌ 정리 중 에러로 중단 — RuntimeError: boom"
+
+
+# ── run_daily_pipeline (08시 하루 1회 체인) ──────────────────────────────────
+
+def test_run_daily_pipeline_runs_collect_analyze_notify_assistant_in_order():
+    """수집·추출 → 채점 → 매칭 알림 → 비서 DM 순서로 이어서 실행한다."""
+    calls = []
+    with patch("scheduler.jobs.run_crawl_pipeline", side_effect=lambda: calls.append("collect")), \
+         patch("scheduler.jobs.analyze_job", side_effect=lambda: calls.append("analyze")), \
+         patch("scheduler.jobs.notify_job", side_effect=lambda: calls.append("notify")), \
+         patch("scheduler.jobs.assistant_job", side_effect=lambda: calls.append("assistant")):
+        run_daily_pipeline()
+
+    assert calls == ["collect", "analyze", "notify", "assistant"]
+
+
+def test_run_daily_pipeline_still_scores_and_notifies_when_collect_stops():
+    """수집이 에러로 멈춰도(run_crawl_pipeline은 예외를 삼킨다) 이미 쌓인 공고로 채점·알림은 진행한다."""
+    with patch("scheduler.jobs.crawl_job", side_effect=RuntimeError("사이트 다운")), \
+         patch("scheduler.jobs.ingest_report.send"), \
+         patch("scheduler.jobs.analyze_job") as analyze, \
+         patch("scheduler.jobs.notify_job") as notify, \
+         patch("scheduler.jobs.assistant_job") as assistant:
+        run_daily_pipeline()
+
+    analyze.assert_called_once()
+    notify.assert_called_once()
+    assistant.assert_called_once()
 
 
 # ── analyze_job ──────────────────────────────────────────────────────────

@@ -29,7 +29,7 @@ def register_match_channel(session, discord_user_id: int, channel_id: int, visib
     session.commit()
     logger.info("[command] user_id=%s 매칭 채널 설정 (이전 %s)", user.id, "있음" if previous else "없음")
 
-    text = "✅ 이 채널을 매칭 추천 채널로 정했어요. 내일 아침 9시부터 새 추천이 여기로 와요."
+    text = "✅ 이 채널을 매칭 추천 채널로 정했어요. 내일 아침(8시 수집이 끝난 뒤)부터 새 추천이 여기로 와요."
     if previous and previous != str(channel_id):
         text += "\n(이전 채널로는 더 이상 보내지 않아요.)"
     if visible_to_everyone:
