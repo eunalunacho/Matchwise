@@ -4,6 +4,7 @@
 예외가 발생해도 다음 잡 실행에 영향 없도록 내부에서 처리한다.
 """
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import tempfile
 from io import BytesIO
 import time
 from datetime import date, datetime, timedelta, timezone
+from urllib.parse import unquote_to_bytes, urlsplit
 
 import httpx
 from google.cloud import documentai
@@ -299,6 +301,37 @@ def _ocr_image(image_url: str) -> str:
     raise ValueError(f"알 수 없는 ocr_provider: {provider!r}")
 
 
+def _is_svg(image_url: str) -> bool:
+    """SVG(도형 코드)인지. Document AI가 받지 않고 보통 아이콘·로고라 OCR 대상에서 뺀다."""
+    if image_url.startswith("data:"):
+        return image_url[5:].split(",", 1)[0].lower().startswith("image/svg")
+    return urlsplit(image_url).path.lower().endswith(".svg")
+
+
+def _ocr_target(image_urls: list[str] | None) -> str | None:
+    """OCR할 이미지 — SVG를 건너뛴 첫 이미지. 없으면 None."""
+    return next((url for url in image_urls or [] if not _is_svg(url)), None)
+
+
+def _fetch_image(image_url: str) -> tuple[bytes, str]:
+    """이미지 바이트와 MIME 타입을 구한다.
+
+    본문에 이미지 데이터를 통째로 넣은 data: 주소(`data:[MIME][;base64],[내용]`)는 내려받지 않고 바로 푼다 —
+    주소로 요청하면 'URL too long'으로 실패한다(2026-10-25 실제 사례). ;base64가 있으면 base64, 없으면 퍼센트
+    인코딩으로 푼다. 일반 주소는 내려받고 리다이렉트를 따라간다. MIME을 모르면 image/png로 본다.
+    """
+    if image_url.startswith("data:"):
+        header, _, data = image_url[5:].partition(",")
+        mime_type = header.split(";", 1)[0] or "image/png"
+        if ";base64" in header.lower():
+            return base64.b64decode(data), mime_type
+        return unquote_to_bytes(data), mime_type
+
+    response = httpx.get(image_url, headers=_OCR_HEADERS, timeout=30, follow_redirects=True)
+    response.raise_for_status()
+    return response.content, response.headers.get("content-type") or "image/png"
+
+
 def _image_parts_for_document_ai(content: bytes, mime_type: str) -> list[tuple[bytes, str]]:
     """Document AI 크기 제한(한 변 10,000px)에 맞게 이미지를 (바이트, MIME) 조각 목록으로 만든다.
 
@@ -347,18 +380,15 @@ def _document_ai_client() -> documentai.DocumentProcessorServiceClient:
 def _ocr_image_document_ai(image_url: str) -> str:
     """이미지 1장을 Google Cloud Document AI로 OCR해 텍스트를 반환한다.
 
-    인증은 _document_ai_client()가 고른다(운영은 GSA 키, 로컬은 ADC). 이미지 주소가 리다이렉트되면 따라가고,
+    인증은 _document_ai_client()가 고른다(운영은 GSA 키, 로컬은 ADC). 이미지는 _fetch_image()로 구하고(data: 주소 포함),
     10,000px를 넘는 긴 이미지는 조각으로 나눠 OCR한 뒤 줄바꿈으로 이어 붙인다.
     """
-    response = httpx.get(image_url, headers=_OCR_HEADERS, timeout=30, follow_redirects=True)
-    response.raise_for_status()
+    content, mime_type = _fetch_image(image_url)
 
     settings = get_settings().gcp
     client = _document_ai_client()
     name = client.processor_path(settings.project_id, settings.project_location, settings.doc_processor_id)
-    parts = _image_parts_for_document_ai(
-        response.content, response.headers.get("content-type") or "image/png",
-    )
+    parts = _image_parts_for_document_ai(content, mime_type)
     texts = []
     for content, mime_type in parts:
         raw_document = documentai.RawDocument(content=content, mime_type=mime_type)
@@ -375,13 +405,12 @@ def _ocr_image_claude_code(image_url: str) -> str:
     모델은 claude_ocr_model(기본 sonnet) 고정 — haiku는 2026-09-30 실측에서 회사명을 완전히
     다르게 지어내는 환각을 일으켜 쓰지 않는다.
     """
-    response = httpx.get(image_url, headers=_OCR_HEADERS, timeout=30, follow_redirects=True)
-    response.raise_for_status()
+    content, _ = _fetch_image(image_url)
 
     fd, tmp_path = tempfile.mkstemp(suffix=".png")
     os.close(fd)
     with open(tmp_path, "wb") as f:
-        f.write(response.content)
+        f.write(content)
 
     try:
         model = get_settings().claude_ocr_model
@@ -425,7 +454,7 @@ def _retry_window_start(now: datetime) -> datetime:
 def extract_job() -> dict:
     """crawl_job 직후 실행 — pending/failed/needs_ocr 공고를 추출해 jd_* 필드·eligibility·근무지를 채운다.
 
-    needs_ocr는 첫 이미지(image_urls[0])를 OCR(_ocr_image — settings.ocr_provider로 백엔드 선택)해
+    needs_ocr는 SVG를 뺀 첫 이미지(_ocr_target)를 OCR(_ocr_image — settings.ocr_provider로 백엔드 선택)해
     jobs.jd_text를 채운 뒤(raw_postings는 안 건드림), 곧바로 같은 실행에서 pending과 동일하게 추출까지
     진행한다.
     - OCR 자체가 실패하면(이미지 없음 포함) 상태를 needs_ocr로 그대로 둬 다음 실행에 재시도한다
@@ -476,18 +505,18 @@ def extract_job() -> dict:
             raw = session.query(RawPosting).filter_by(source=job.source, url=job.url).first()
             hints = raw.hints if raw else None
 
-            image_urls = raw.image_urls if raw else None
+            ocr_url = _ocr_target(raw.image_urls if raw else None)
             ocr_done = False
             if job.extract_status == "needs_ocr":
-                if not image_urls:
+                if not ocr_url:
                     logger.warning(
-                        "[extract] needs_ocr인데 참조할 이미지가 없음 job_id=%s — 다음 실행에 재시도",
+                        "[extract] needs_ocr인데 OCR할 이미지가 없음(SVG 제외) job_id=%s — 다음 실행에 재시도",
                         job.id,
                     )
                     stats["ocr_failed"] += 1
                     continue
                 try:
-                    job.jd_text = _ocr_image(image_urls[0])
+                    job.jd_text = _ocr_image(ocr_url)
                     session.flush()
                     ocr_done = True
                 except Exception:
@@ -500,10 +529,10 @@ def extract_job() -> dict:
                 summary = summarize_jd(job.jd_text or "", hints=hints)
                 # 텍스트가 한 줄(회사명·접수기한 등)이라도 있으면 pending으로 분류되지만 본문은 이미지인 공고가 있다
                 # (2026-10-14 실제 사례). 요약에 하는 일·자격요건이 모두 비고 이미지가 있으면 OCR로 보완해 다시 요약한다.
-                if (not summary["tasks"] and not summary["qualifications"] and image_urls
+                if (not summary["tasks"] and not summary["qualifications"] and ocr_url
                         and not ocr_done and not _gemini_budget_exhausted(session)):
                     try:
-                        ocr_text = _ocr_image(image_urls[0])
+                        ocr_text = _ocr_image(ocr_url)
                     except Exception:
                         logger.exception("[extract] 보완 OCR 실패 job_id=%s — 텍스트 요약 결과로 저장", job.id)
                         stats["ocr_failed"] += 1

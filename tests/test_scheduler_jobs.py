@@ -571,6 +571,87 @@ def test_extract_job_needs_ocr_with_empty_image_list_stays_needs_ocr(session):
     assert session.query(Job).filter_by(url="https://a.com/1").first().extract_status == "needs_ocr"
 
 
+def test_extract_job_ocr_skips_svg_and_uses_next_image(session):
+    """SVG(도형 코드)는 Document AI가 받지 않으므로 건너뛰고 다음 이미지를 OCR한다."""
+    session.add(Job(source="a", url="https://a.com/1", title="t", company="c", jd_text="", extract_status="needs_ocr"))
+    session.add(RawPosting(source="a", url="https://a.com/1", jd_text="", image_urls=[
+        "data:image/svg+xml,%3Csvg%3E%3C/svg%3E", "https://img.example.com/logo.svg?v=2", "https://img.example.com/jd.png",
+    ]))
+    session.commit()
+
+    with patch("scheduler.jobs.get_session", return_value=session), \
+         patch("scheduler.jobs._ocr_image", return_value="OCR 텍스트") as mock_ocr, \
+         patch("scheduler.jobs.summarize_jd", return_value=_EMPTY_SUMMARY), \
+         patch("scheduler.jobs.time.sleep"):
+        extract_job()
+
+    mock_ocr.assert_called_once_with("https://img.example.com/jd.png")
+
+
+def test_extract_job_needs_ocr_with_only_svg_images_stays_needs_ocr(session):
+    session.add(Job(source="a", url="https://a.com/1", title="t", company="c", jd_text="", extract_status="needs_ocr"))
+    session.add(RawPosting(source="a", url="https://a.com/1", jd_text="", image_urls=["https://img.example.com/a.SVG"]))
+    session.commit()
+
+    with patch("scheduler.jobs.get_session", return_value=session), \
+         patch("scheduler.jobs._ocr_image") as mock_ocr, \
+         patch("scheduler.jobs.summarize_jd") as mock_sum, \
+         patch("scheduler.jobs.time.sleep"):
+        extract_job()
+
+    mock_ocr.assert_not_called()
+    mock_sum.assert_not_called()
+    assert session.query(Job).filter_by(url="https://a.com/1").first().extract_status == "needs_ocr"
+
+
+def test_fetch_image_decodes_base64_data_uri_without_download():
+    """본문에 이미지 데이터를 통째로 넣은 data: 주소는 내려받지 않고 바로 푼다 (2026-10-25 'URL too long' 사례)."""
+    import base64
+    from scheduler.jobs import _fetch_image
+
+    png = _png_bytes(10, 10)
+    data_uri = "data:image/png;base64," + base64.b64encode(png).decode()
+    with patch("scheduler.jobs.httpx.get") as mock_get:
+        content, mime_type = _fetch_image(data_uri)
+
+    mock_get.assert_not_called()
+    assert content == png
+    assert mime_type == "image/png"
+
+
+def test_fetch_image_decodes_percent_encoded_data_uri():
+    from scheduler.jobs import _fetch_image
+
+    content, mime_type = _fetch_image("data:image/jpeg,%FF%D8%FF")
+    assert content == b"\xff\xd8\xff"
+    assert mime_type == "image/jpeg"
+
+
+def test_fetch_image_data_uri_without_mime_defaults_to_png():
+    from scheduler.jobs import _fetch_image
+
+    _, mime_type = _fetch_image("data:;base64,AAAA")
+    assert mime_type == "image/png"
+
+
+def test_ocr_image_document_ai_sends_decoded_data_uri_bytes():
+    import base64
+    from scheduler.jobs import _ocr_image_document_ai
+
+    png = _png_bytes(20, 30)
+    client = _fake_docai(["본문"])
+    with patch("scheduler.jobs.httpx.get") as mock_get, \
+         patch("scheduler.jobs.documentai.DocumentProcessorServiceClient", return_value=client), \
+         patch("scheduler.jobs.get_settings", return_value=_adc_settings()):
+        result = _ocr_image_document_ai("data:image/png;base64," + base64.b64encode(png).decode())
+
+    assert result == "본문"
+    mock_get.assert_not_called()
+    raw_document = client.process_document.call_args.kwargs["request"].raw_document
+    assert raw_document.content == png
+    assert raw_document.mime_type == "image/png"
+
+
 def test_extract_job_ocr_failure_keeps_needs_ocr_for_retry(session):
     """OCR 자체가 실패하면 상태를 needs_ocr로 그대로 둬서 다음 실행에 다시 시도한다(failed로 안 빠짐)."""
     session.add(Job(source="a", url="https://a.com/1", title="t", company="c", jd_text="", extract_status="needs_ocr"))
