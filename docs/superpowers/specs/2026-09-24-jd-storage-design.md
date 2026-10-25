@@ -137,7 +137,7 @@ S3/parquet, dbt, Airflow, 별도 웹하우스, 이벤트 큐, 스키마 레지�
 | `title` / `company` | 목록 API의 `title` / `name` |
 | `jd_text` | 상세 API `content`(HTML)에서 뽑은 텍스트. 이미지 JD면 `""` |
 | `deadline` | `end_time` |
-| `payload` | `{"calendar": 목록 항목, "detail": 상세 응답}` |
+| `payload` | `{"listing": 목록 항목, "detail": 상세 응답}` (2026-10-25 이전 수집분은 `"calendar"`: 캘린더 API 항목) |
 | `hints` | 사전 필터를 통과한 포지션의 `field`와 채용구분 코드→표시 값 |
 | `image_urls` | 상세 API `content`(HTML)의 `<img src>` |
 

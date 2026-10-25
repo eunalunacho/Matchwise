@@ -1,10 +1,15 @@
-"""자소설닷컴(jasoseol.com) 채용 캘린더 크롤러.
+"""자소설닷컴(jasoseol.com) 채용공고 크롤러.
 
 Playwright 없이 사이트가 내부에서 쓰는 JSON API를 직접 호출한다 (비공식 API — 스키마가 바뀔 수 있음).
 
-  1) POST /employment/calendar_list.json  하루 창과 겹치는 공고 목록 (포지션별 채용구분·직무코드 포함)
-  2) GET  /api/v1/duty-groups             직무 분류 트리 — IT·인터넷(94)과 그 하위 코드를 구한다
-  3) GET  /api/v1/employment_companies/id 상세 — 기업 지원 페이지 URL, JD 본문(HTML)
+  1) GET /api/v1/employment_companies?all=true  지금 열려 있는 공고 전체 (포지션별 채용구분·직무코드 포함)
+  2) GET /api/v1/duty-groups                   직무 분류 트리 — IT·인터넷(94)과 그 하위 코드를 구한다
+  3) GET /api/v1/employment_companies/{id}     상세 — 기업 지원 페이지 URL, JD 본문(HTML)
+
+목록은 예전엔 캘린더 API(POST /employment/calendar_list.json)를 하루 창으로 나눠 썼다. 2026-10-25 확인 결과
+그 API가 "그날 마감하는" 공고만 주도록 바뀌어 시작일 기준 수집이 0건이 됐고, 마감일 기준 60일치를 모아도
+열린 공고 목록(1)의 일부(시작 10/19~23 기준 30건 vs 87건, 목록에 없는 건 0건)였다. 목록은 시작일 필터
+파라미터를 무시하므로 받은 뒤 시작일로 직접 거른다.
 
 대상: 시작일이 조회 기간(기본 최근 2일, KST) 안에 있고, 한 포지션이 채용구분(신입/인턴/신입·경력)과
 IT 직무를 동시에 만족하는 공고. JD가 이미지면 jd_text는 빈 문자열이고 이미지는 payload에 남는다.
@@ -28,7 +33,7 @@ from crawler.base import (
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://jasoseol.com"
-CALENDAR_URL = f"{BASE_URL}/employment/calendar_list.json"
+LIST_URL = f"{BASE_URL}/api/v1/employment_companies"
 DUTY_GROUPS_URL = f"{BASE_URL}/api/v1/duty-groups"
 DETAIL_URL = f"{BASE_URL}/api/v1/employment_companies/{{posting_id}}"
 
@@ -53,7 +58,7 @@ def job_url(posting_id: int) -> str:
 
 
 def _divisions(employment: dict) -> set[int]:
-    """division은 목록 API에서는 int, 상세 API에서는 list다."""
+    """division은 보통 list다(목록·상세 API). 예전 캘린더 API처럼 int로 와도 받는다."""
     raw = employment.get("division")
     if isinstance(raw, list):
         return set(raw)
@@ -64,10 +69,6 @@ def _html_to_text(html: str | None) -> str:
     if not html:
         return ""
     return BeautifulSoup(html, "html.parser").get_text(separator="\n", strip=True)
-
-
-def _to_utc_z(moment: datetime) -> str:
-    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
 class JasoseolCrawler(BaseCrawler):
@@ -114,13 +115,13 @@ class JasoseolCrawler(BaseCrawler):
         first_day = today - timedelta(days=self._lookback_days)
 
         it_duty_ids = self._load_it_duty_ids(client)
-        items = self._fetch_calendar(client, first_day, today)
+        items = self._get_json(client.get, LIST_URL, params={"all": "true"})
 
         jobs: list[RawJob] = []
         for item in items:
             started = datetime.fromisoformat(item["start_time"]).astimezone(KST).date()
             if not first_day <= started < today:
-                continue  # 조회 구간과 겹쳐서 내려온, 이전에 시작한 공고
+                continue  # 이전에 시작해 아직 열려 있거나, 시작 예정인 공고
 
             matched = [e for e in item.get("employments", []) if self._matches(e, it_duty_ids)]
             if not matched:
@@ -146,7 +147,7 @@ class JasoseolCrawler(BaseCrawler):
     @staticmethod
     def _matches(employment: dict, it_duty_ids: set[int]) -> bool:
         """한 포지션이 채용구분(신입/인턴/신입·경력)과 IT 직무를 동시에 만족하는지."""
-        duty_ids = {g["group_id"] for g in employment.get("duty_groups", [])}
+        duty_ids = set(employment.get("duty_group_ids") or [])
         return bool(_divisions(employment) & TARGET_DIVISIONS) and bool(duty_ids & it_duty_ids)
 
     def _load_it_duty_ids(self, client: httpx.Client) -> set[int]:
@@ -163,26 +164,6 @@ class JasoseolCrawler(BaseCrawler):
                 ids.add(child)
                 stack.append(child)
         return ids
-
-    def _fetch_calendar(self, client: httpx.Client, first_day: date, today: date) -> list[dict]:
-        """[first_day, today) 구간의 공고를 하루 창 단위로 조회해 합친다.
-
-        기간을 넓혀 한 번에 조회하면 일부 공고가 누락된다(2026-09-24 관찰: 하루 창에서 12건이던
-        9/23 시작 공고가 2일 창에서는 3건). 하루 창은 14일간 넓은 창(9/1~9/24)과 공고가 완전히
-        일치해서, 하루 창으로 나눠 조회한다. 같은 공고가 여러 창에 나타날 수 있어 id로 중복을 없앤다.
-        """
-        items: dict[int, dict] = {}
-        day = first_day
-        while day < today:
-            next_day = day + timedelta(days=1)
-            body = {
-                "start_time": _to_utc_z(datetime(day.year, day.month, day.day, tzinfo=KST)),
-                "end_time": _to_utc_z(datetime(next_day.year, next_day.month, next_day.day, tzinfo=KST)),
-            }
-            for item in self._get_json(client.post, CALENDAR_URL, json=body)["employment"]:
-                items.setdefault(item["id"], item)
-            day = next_day
-        return list(items.values())
 
     def _build_job(
         self, client: httpx.Client, item: dict, matched: list[dict], url: str
@@ -218,7 +199,7 @@ class JasoseolCrawler(BaseCrawler):
             jd_text=_html_to_text(detail.get("content")),
             deadline=datetime.fromisoformat(end_time) if end_time else None,
             apply_url=detail.get("employment_page_url"),
-            payload={"calendar": item, "detail": detail},
+            payload={"listing": item, "detail": detail},
             hints={"positions": positions},
             image_urls=extract_image_urls(detail.get("content")),
         )

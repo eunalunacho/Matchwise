@@ -48,13 +48,17 @@ def _post(post_id, *, title="회사｜포지션", content=None, categories=(CAT_
 
 
 class FakeInthiswork:
-    """MockTransport 핸들러. 받은 요청을 기록해 검증에 쓴다."""
+    """MockTransport 핸들러. 받은 요청을 기록해 검증에 쓴다.
 
-    def __init__(self, posts, categories=CATEGORIES, tags=TAGS, status=200):
+    failures: {경로: [실패 응답, ...]} — 그 경로의 첫 요청들에 차례로 돌려줄 응답. 다 쓰면 정상 응답.
+    """
+
+    def __init__(self, posts, categories=CATEGORIES, tags=TAGS, status=200, failures=None):
         self.posts = posts
         self.categories = categories
         self.tags = tags
         self.status = status
+        self.failures = {path: list(responses) for path, responses in (failures or {}).items()}
         self.requests: list[tuple[str, dict]] = []
 
     def paths(self):
@@ -66,6 +70,11 @@ class FakeInthiswork:
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path, params = request.url.path, dict(request.url.params)
         self.requests.append((path, params))
+        if self.failures.get(path):
+            failure = self.failures[path].pop(0)
+            if isinstance(failure, Exception):
+                raise failure
+            return failure
         if self.status != 200:
             return httpx.Response(self.status, json={"code": "boom"})
         if path == "/wp-json/wp/v2/categories":
@@ -84,11 +93,15 @@ class FakeInthiswork:
         return httpx.Response(404)
 
 
-def _crawl(posts, *, known_urls=None, limit=None, lookback_days=None, page_size=100, **fake_kwargs):
+def _crawl(posts, *, known_urls=None, limit=None, lookback_days=None, page_size=100, sleeps=None, **fake_kwargs):
+    """sleeps: 넘기면 크롤러가 쉰 시간(초)을 여기에 기록한다. 실제로는 쉬지 않는다."""
     fake = FakeInthiswork(posts, **fake_kwargs)
     client = httpx.Client(transport=httpx.MockTransport(fake))
     options = {} if lookback_days is None else {"lookback_days": lookback_days}
-    crawler = InthisworkCrawler(client=client, today=TODAY, page_size=page_size, **options)
+    record = sleeps if sleeps is not None else []
+    crawler = InthisworkCrawler(
+        client=client, today=TODAY, page_size=page_size, sleep=record.append, **options
+    )
     jobs = crawler.fetch_jobs(limit=limit, known_urls=known_urls)
     return jobs, fake
 
@@ -163,9 +176,63 @@ def test_missing_taxonomy_name_fails_loudly():
         _crawl([_post(1)], tags=[{"id": TAG_STARTUP, "name": "스타트업"}])
 
 
-def test_http_error_propagates():
+def test_http_error_propagates_after_retries():
+    """5xx가 계속되면 처음 1번 + 재시도 2번 후 에러를 올린다."""
     with pytest.raises(httpx.HTTPStatusError):
         _crawl([_post(1)], status=503)
+
+
+# ── 요청 간격 · 재시도 (2026-10-25: Railway에서 429) ─────────────────────────
+
+def test_waits_between_requests_but_not_before_the_first():
+    sleeps = []
+    _crawl([_post(1)], sleeps=sleeps)
+    assert sleeps == [1.5, 1.5]  # categories → (1.5) → tags → (1.5) → posts
+
+
+def test_retries_429_using_retry_after_header():
+    sleeps = []
+    jobs, fake = _crawl(
+        [_post(1)],
+        sleeps=sleeps,
+        failures={"/wp-json/wp/v2/posts": [httpx.Response(429, headers={"Retry-After": "7"})]},
+    )
+    assert len(jobs) == 1
+    assert fake.paths().count("/wp-json/wp/v2/posts") == 2
+    assert sleeps == [1.5, 1.5, 7.0]
+
+
+def test_retries_without_retry_after_wait_30_then_60_and_give_up():
+    sleeps = []
+    too_many = [httpx.Response(429) for _ in range(3)]
+    with pytest.raises(httpx.HTTPStatusError):
+        _crawl([_post(1)], sleeps=sleeps, failures={"/wp-json/wp/v2/posts": too_many})
+    assert sleeps == [1.5, 1.5, 30.0, 60.0]
+
+
+def test_retry_after_is_capped():
+    sleeps = []
+    _crawl(
+        [_post(1)],
+        sleeps=sleeps,
+        failures={"/wp-json/wp/v2/categories": [httpx.Response(429, headers={"Retry-After": "3600"})]},
+    )
+    assert sleeps[0] == 120.0
+
+
+def test_transport_error_is_retried():
+    jobs, fake = _crawl(
+        [_post(1)],
+        failures={"/wp-json/wp/v2/tags": [httpx.ConnectError("reset")]},
+    )
+    assert len(jobs) == 1
+    assert fake.paths().count("/wp-json/wp/v2/tags") == 2
+
+
+def test_client_error_other_than_429_is_not_retried():
+    fake_kwargs = {"failures": {"/wp-json/wp/v2/posts": [httpx.Response(403)]}}
+    with pytest.raises(httpx.HTTPStatusError):
+        _crawl([_post(1)], **fake_kwargs)
 
 
 # ── 중복 · 제한 ────────────────────────────────────────────────────────────
@@ -274,7 +341,9 @@ def test_all_body_images_are_listed_in_order():
 def test_seen_count_includes_known_posts():
     """목록에서 본 글 수는 이미 아는 글도 센다 — 사이트가 0건을 주는 이상을 신규 0건과 구분하기 위해."""
     fake = FakeInthiswork([_post(1), _post(2), _post(3)])
-    crawler = InthisworkCrawler(client=httpx.Client(transport=httpx.MockTransport(fake)), today=TODAY)
+    crawler = InthisworkCrawler(
+        client=httpx.Client(transport=httpx.MockTransport(fake)), today=TODAY, sleep=lambda _: None
+    )
     jobs = crawler.fetch_jobs(known_urls={"https://inthiswork.com/archives/1"})
 
     assert len(jobs) == 2
