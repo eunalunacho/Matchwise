@@ -49,7 +49,7 @@
   <thead><tr><th>적합도</th><th>매칭 이유</th></tr></thead>
   <tbody>
     <tr>
-      <td>{{ score.fit_score }}{% if stale %} <span class="tag">구 점수</span>{% endif %}</td>
+      <td>{% if score.fit_score is none %}{{ grade_label }}{% else %}{{ score.fit_score }} <span class="tag">{{ grade_label }}</span>{% endif %}{% if stale %} <span class="tag">구 점수</span>{% endif %}</td>
       <td>{{ score.fit_reasons }}</td>
     </tr>
   </tbody>

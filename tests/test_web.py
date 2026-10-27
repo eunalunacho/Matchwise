@@ -170,6 +170,29 @@ def test_dashboard_only_shows_my_fit_score():
     assert "40" not in resp.text
 
 
+def test_dashboard_shows_grade_label():
+    me = _make_user()
+    _login_as(me)
+    _job_with_score(me, fit_score=85)
+    resp = client.get("/dashboard")
+    assert resp.status_code == 200
+    assert "85" in resp.text and "추천" in resp.text
+
+
+def test_dashboard_renders_none_score_row_with_grade_label():
+    """지원 불가/판단 불가 행(fit_score None)도 대시보드·상세가 깨지지 않고 라벨을 보여준다."""
+    me = _make_user()
+    _login_as(me)
+    job_id = _job_with_score(me, fit_score=None, fit_detail={"status": "ineligible"})
+    resp = client.get("/dashboard")
+    assert resp.status_code == 200
+    assert "지원 불가" in resp.text
+    assert "None" not in resp.text
+    detail = client.get(f"/jobs/{job_id}")
+    assert detail.status_code == 200
+    assert "지원 불가" in detail.text
+
+
 # ── job detail ───────────────────────────────────────────────────────────
 
 def test_job_detail_returns_200_and_shows_jd_summary():

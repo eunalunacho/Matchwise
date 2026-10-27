@@ -13,7 +13,7 @@ from db.orm import (
     Application, ApplicationQuestion, Experience, GeminiUsage, Job, RawPosting, ResumeDraft, User, JobScore,
 )
 from scheduler.jobs import (
-    _GEMINI_DAILY_CAP, _is_scoring_target, _retry_window_start, cleanup_job, crawl_job, extract_job,
+    _GEMINI_DAILY_CAP, _gemini_calls_today, _is_scoring_target, _retry_window_start, cleanup_job, crawl_job, extract_job,
     analyze_job, run_crawl_pipeline, run_daily_pipeline,
 )
 
@@ -1450,18 +1450,142 @@ def test_analyze_job_records_gemini_call_on_success(session):
     assert usage.call_count == 1
 
 
+def _ok_job(url, title="t", company="c", **kw):
+    return Job(source="a", url=url, title=title, company=company, jd_text="본문",
+               extract_status="ok", jd_tasks=["업무"], **kw)
+
+
+def test_analyze_passes_preferences_text_and_weights_to_score_fit(session):
+    prefs = {"constraints": {"병역": "비대상", "career_months": 6, "max_required_years": 2},
+             "weights": {"department_preferred": 0.1}}
+    user = User(discord_id="1", username="u", is_active=True, basic_info=_PROFILE, preferences=prefs)
+    session.add_all([user, _ok_job("https://a.com/1")])
+    session.commit()
+
+    with patch("scheduler.jobs.get_session", return_value=session),          patch("scheduler.jobs.score_fit", return_value={"fit_score": 1, "fit_reasons": ""}) as mock_score,          patch("scheduler.jobs.time.sleep"):
+        analyze_job()
+
+    kwargs = mock_score.call_args.kwargs
+    assert "병역: 비대상" in kwargs["preferences_text"]
+    assert kwargs["weights"]["department_preferred"] == 0.1
+    assert kwargs["career"] == {"months": 6.0, "max_years": 2.0}
+
+
+def test_analyze_passes_preferences_to_rescore_too(session):
+    prefs = {"constraints": {"병역": "비대상"}}
+    user = User(discord_id="1", username="u", is_active=True, basic_info=_PROFILE, preferences=prefs)
+    job = _ok_job("https://a.com/1")
+    session.add_all([user, job])
+    session.flush()
+    session.add(JobScore(job_id=job.id, user_id=user.id, fit_score=1, fit_reasons="",
+                         rescore_requested_at=datetime.now(timezone.utc)))
+    session.commit()
+
+    with patch("scheduler.jobs.get_session", return_value=session),          patch("scheduler.jobs.score_fit", return_value=_RESULT) as mock_score,          patch("scheduler.jobs.time.sleep"):
+        analyze_job()
+
+    kwargs = mock_score.call_args.kwargs
+    assert "병역: 비대상" in kwargs["preferences_text"]
+    assert "weights" in kwargs
+
+
+def test_closed_jobs_are_not_scored(session):
+    """마감이 지난 공고는 score_fit도 Gemini 한도도 쓰지 않는다. 마감일 없음(채용 시 마감)은 대상."""
+    user = User(discord_id="1", username="u", is_active=True, basic_info=_PROFILE)
+    closed = _ok_job("https://a.com/1", deadline=datetime.now(timezone.utc) - timedelta(days=1))
+    open_ = _ok_job("https://a.com/2", title="다른 공고", deadline=None)
+    session.add_all([user, closed, open_])
+    session.commit()
+    open_id = open_.id
+
+    with patch("scheduler.jobs.get_session", return_value=session),          patch("scheduler.jobs.score_fit", return_value={"fit_score": 1, "fit_reasons": ""}) as mock_score,          patch("scheduler.jobs.time.sleep"):
+        analyze_job()
+
+    assert mock_score.call_count == 1
+    assert {s.job_id for s in session.query(JobScore).all()} == {open_id}
+    assert session.query(GeminiUsage).filter_by(usage_date=date.today()).first().call_count == 1
+
+
+def test_duplicate_posting_is_scored_once_per_user(session):
+    """같은 공고(회사+제목 키)가 이미 그 유저 점수를 가지면 건너뛰고, 같은 실행의 두 번째 중복도 건너뛴다."""
+    u1 = User(discord_id="1", username="u1", is_active=True, basic_info=_PROFILE)
+    u2 = User(discord_id="2", username="u2", is_active=True, basic_info=_PROFILE)
+    scored = _ok_job("https://a.com/1", title="한국전자기술연구원｜2026년 공개채용", company="한국전자기술연구원")
+    dup_old = _ok_job("https://b.com/1", title="2026년 공개채용", company="한국전자기술연구원")
+    new1 = _ok_job("https://a.com/2", title="새 공고", company="X")
+    new2 = _ok_job("https://b.com/2", title="X｜새 공고", company="X")
+    session.add_all([u1, u2, scored, dup_old, new1, new2])
+    session.flush()
+    session.add(JobScore(job_id=scored.id, user_id=u1.id, fit_score=1, fit_reasons=""))
+    session.commit()
+    ids = (scored.id, dup_old.id, new1.id, new2.id, u1.id, u2.id)
+    scored_id, dup_old_id, new1_id, new2_id, u1_id, u2_id = ids
+
+    with patch("scheduler.jobs.get_session", return_value=session),          patch("scheduler.jobs.score_fit", return_value={"fit_score": 1, "fit_reasons": ""}) as mock_score,          patch("scheduler.jobs.time.sleep"):
+        analyze_job()
+
+    pairs = {(s.job_id, s.user_id) for s in session.query(JobScore).all()}
+    # u1: 기존 + new1만 (dup_old·new2 중복). u2: 키별 첫 공고 하나씩 (scored 또는 dup_old 하나, new1)
+    assert (dup_old_id, u1_id) not in pairs
+    assert (new2_id, u1_id) not in pairs and (new2_id, u2_id) not in pairs
+    assert (new1_id, u1_id) in pairs and (new1_id, u2_id) in pairs
+    assert sum(1 for j, u in pairs if u == u2_id and j in (scored_id, dup_old_id)) == 1
+    assert mock_score.call_count == 3
+
+
+def test_analyze_uses_user_work_locations_for_region_filter(session):
+    """유저 선호의 constraints.work_locations가 근무지 관문이 된다. 없으면 기본 지역."""
+    busan_user = User(discord_id="1", username="b", is_active=True, basic_info=_PROFILE,
+                      preferences={"constraints": {"work_locations": ["부산"]}})
+    default_user = User(discord_id="2", username="d", is_active=True, basic_info=_PROFILE)
+    busan = _ok_job("https://a.com/1", work_locations=["부산 해운대구"])
+    session.add_all([busan_user, default_user, busan])
+    session.commit()
+    job_id, busan_uid = busan.id, busan_user.id
+
+    with patch("scheduler.jobs.get_session", return_value=session),          patch("scheduler.jobs.score_fit", return_value={"fit_score": 1, "fit_reasons": ""}),          patch("scheduler.jobs.time.sleep"):
+        analyze_job()
+
+    assert {(s.job_id, s.user_id) for s in session.query(JobScore).all()} == {(job_id, busan_uid)}
+
+
+def test_is_scoring_target_uses_given_work_locations():
+    assert _is_scoring_target(_job(work_locations=["부산 해운대구"]), ["부산"]) is True
+    assert _is_scoring_target(_job(work_locations=["서울 강남구"]), ["부산"]) is False
+    assert _is_scoring_target(_job(work_locations=["부산 해운대구"]), []) is False   # 빈 목록 → 기본 지역으로 폴백
+    assert _is_scoring_target(_job(work_locations=["부산 해운대구"]), None) is False
+
+
 # ── _is_scoring_target: 채점 전 신입·지역 필터 ────────────────────────────────
 
-def _job(eligibility=None, work_locations=None, jd_tasks=("RAG 구축",)) -> Job:
+def _job(eligibility=None, work_locations=None, jd_tasks=("RAG 구축",), jd_qualifications=None) -> Job:
     return Job(source="a", url="https://a.com/x", title="t", company="c", jd_text="본문",
                extract_status="ok", eligibility=eligibility, work_locations=work_locations,
-               jd_tasks=list(jd_tasks) if jd_tasks is not None else None)
+               jd_tasks=list(jd_tasks) if jd_tasks is not None else None,
+               jd_qualifications=jd_qualifications)
 
 
 @pytest.mark.parametrize("jd_tasks", [[], None])
-def test_is_scoring_target_excludes_job_without_tasks(jd_tasks):
-    """하는 일이 비어 있으면 판단할 근거가 없다 — 본문 없는 공고가 만점을 받은 사례(2026-10-14) 방지."""
+def test_is_scoring_target_excludes_job_without_tasks_and_qualifications(jd_tasks):
+    """하는 일·자격요건이 둘 다 비면 판단할 근거가 없다 — 본문 없는 공고가 만점을 받은 사례(2026-10-14) 방지."""
     assert _is_scoring_target(_job(jd_tasks=jd_tasks)) is False
+
+
+def test_is_scoring_target_scores_job_with_qualifications_but_no_tasks():
+    """담당업무 없이 자격요건만 있어도 채점한다 (2026-10-27 결정)."""
+    assert _is_scoring_target(_job(jd_tasks=None, jd_qualifications=["Python 가능자"])) is True
+
+
+@pytest.mark.parametrize("min_years, max_years, expected", [
+    (1, 2, True),      # 1년 요구, 허용 2년 → 채점 (경력 항목은 비율 점수)
+    (2, 2, True),
+    (3, 2, False),     # 허용 초과
+    (None, 2, False),  # 연차 모름 + 신입 배제
+    (1, None, False),  # 선호에 허용 경력 없음 → 예전처럼 제외
+])
+def test_is_scoring_target_allows_short_career_requirements(min_years, max_years, expected):
+    job = _job(eligibility={"new_grad_ok": False, "min_years": min_years, "evidence": "경력"})
+    assert _is_scoring_target(job, None, max_years) is expected
 
 
 @pytest.mark.parametrize("eligibility, expected", [
@@ -1695,3 +1819,53 @@ def test_cleanup_job_deletes_expired_job_with_only_a_pass_and_its_records(sessio
     assert session.query(Job).count() == 0
     assert session.query(Application).count() == 0
     assert session.query(ApplicationEvent).count() == 0
+
+
+# ── 최종 리뷰 보정 (2026-10-27) ──────────────────────────────────────────
+
+def test_analyze_job_scores_both_jobs_with_empty_company_and_title(session):
+    """회사·제목이 비어 키가 ""인 공고는 서로 중복으로 취급하지 않는다."""
+    user = User(discord_id="1", username="u", is_active=True, basic_info=_PROFILE)
+    session.add_all([user, _ok_job("https://a.com/1", title="", company=""),
+                     _ok_job("https://a.com/2", title="", company="")])
+    session.commit()
+
+    with patch("scheduler.jobs.get_session", return_value=session),          patch("scheduler.jobs.score_fit", return_value=_RESULT) as mock_score,          patch("scheduler.jobs.time.sleep"):
+        analyze_job()
+
+    assert mock_score.call_count == 2
+    assert session.query(JobScore).count() == 2
+
+
+def test_analyze_job_rescore_skips_closed_jobs(session):
+    """재채점 요청이 있어도 마감 지난 공고는 score_fit·Gemini 한도를 쓰지 않는다."""
+    user = User(discord_id="1", username="u", is_active=True, basic_info=_PROFILE)
+    job = _ok_job("https://a.com/1", deadline=datetime.now(timezone.utc) - timedelta(days=1))
+    session.add_all([user, job])
+    session.flush()
+    session.add(JobScore(job_id=job.id, user_id=user.id, fit_score=50, fit_reasons="",
+                         rescore_requested_at=datetime(2026, 10, 15, 3, 0)))
+    session.commit()
+
+    with patch("scheduler.jobs.get_session", return_value=session),          patch("scheduler.jobs.score_fit") as mock_score,          patch("scheduler.jobs.time.sleep"):
+        analyze_job()
+
+    mock_score.assert_not_called()
+    assert _gemini_calls_today(session) == 0
+
+
+def test_analyze_job_work_locations_bare_string_is_one_keyword(session):
+    """constraints.work_locations가 문자열이면 한 글자씩이 아니라 한 키워드로 본다."""
+    prefs = {"constraints": {"work_locations": "서울"}}
+    user = User(discord_id="1", username="u", is_active=True, basic_info=_PROFILE, preferences=prefs)
+    ulsan = _ok_job("https://a.com/1", title="울산 공고", work_locations=["울산"])
+    seoul = _ok_job("https://a.com/2", title="서울 공고", company="d", work_locations=["서울 강남"])
+    session.add_all([user, ulsan, seoul])
+    session.commit()
+    seoul_id = seoul.id
+
+    with patch("scheduler.jobs.get_session", return_value=session),          patch("scheduler.jobs.score_fit", return_value=_RESULT) as mock_score,          patch("scheduler.jobs.time.sleep"):
+        analyze_job()
+
+    assert mock_score.call_count == 1
+    assert session.query(JobScore).one().job_id == seoul_id

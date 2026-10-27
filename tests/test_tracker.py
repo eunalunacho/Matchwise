@@ -153,6 +153,24 @@ def test_missed_recommendations_are_cards_without_reaction_after_3_days(session)
     assert [s.job.company for s in missed] == ["missed-higher", "missed"]
 
 
+def test_missed_recommendations_use_grades_not_a_fixed_score(session):
+    """방향 mismatch·지원 불가·권유 미만 점수는 놓친 추천에 안 나오고, 권유(70점대)는 나온다."""
+    user = _user(session)
+    for company, fit, detail in (
+        ("suggest", 72, {"direction": "match"}),
+        ("mismatch", 95, {"direction": "mismatch"}),
+        ("below", 65, {}),
+        ("ineligible", None, {"status": "ineligible"}),
+    ):
+        _sent_score(session, user, company, fit=fit)
+        row = session.query(JobScore).join(Job).filter(Job.company == company).one()
+        row.fit_detail = detail
+    session.flush()
+
+    missed = missed_recommendations(session, user.id, NOW)
+    assert [s.job.company for s in missed] == ["suggest"]
+
+
 # ── 최근 변화 ───────────────────────────────────────────────────────────
 
 def test_recent_changes_since_and_without_passes(session):

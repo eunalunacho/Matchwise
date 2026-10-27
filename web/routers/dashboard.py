@@ -7,6 +7,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
+from analysis.grading import GRADE_LABELS, grade_for
+from analysis.preferences import grade_config
 from analysis.scorer import is_stale_score
 from db.orm import Application, ApplicationQuestion, Job, JobScore, User
 from tracker.applications import STATUS_LABELS, STATUSES, change_status
@@ -15,6 +17,17 @@ from web.deps import get_current_user, get_db
 router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).parent.parent / "templates"))
 templates.env.globals["status_labels"] = STATUS_LABELS
+
+
+def _grade_label(score: JobScore | None, job: Job, user: User) -> str:
+    """점수 행의 등급 라벨(추천·권유·지원 불가 등). 점수 행이 없으면 빈 문자열."""
+    if score is None:
+        return ""
+    grade = grade_for(
+        score.fit_score, score.fit_detail, job.deadline,
+        datetime.now(timezone.utc), grade_config(user.preferences),
+    )
+    return GRADE_LABELS[grade]
 
 
 def _stale_unrequested(db: Session, user: User) -> list[JobScore]:
@@ -47,7 +60,8 @@ def dashboard(
         query = query.filter(Job.source == source)
 
     rows = [
-        (job, score, app, score is not None and is_stale_score(score, current_user.profile_version))
+        (job, score, app, score is not None and is_stale_score(score, current_user.profile_version),
+         _grade_label(score, job, current_user))
         for job, score, app in query.order_by(JobScore.fit_score.desc().nullslast()).all()
     ]
     sources = [s for (s,) in db.query(Job.source).distinct().all()]
@@ -140,6 +154,7 @@ def job_detail(
             "job": job,
             "summary": summary,
             "score": score,
+            "grade_label": _grade_label(score, job, current_user) if job else "",
             "stale": score is not None and is_stale_score(score, current_user.profile_version),
             "application": application,
             "questions": questions,

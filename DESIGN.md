@@ -44,9 +44,10 @@ AWS EC2 t2.micro — Docker Compose
 │
 ├─ Layer 1. 파이프라인  (v2 승계 — 일반 코드, 에이전트 아님)
 │    scheduler (APScheduler)
-│      08:00 → run_daily_pipeline: run_crawl_pipeline (crawl_job → extract_job 순차 함수 호출, 워크플로우 체인 —
+│      평일 08:00 → run_daily_pipeline: run_crawl_pipeline (crawl_job → extract_job 순차 함수 호출, 워크플로우 체인 —
 │                                  고정 시간에 따로 도는 게 아니라 크롤링이 끝나면 바로 추출로 이어짐)
 │                                  crawl_job:   인디스워크 WordPress API · 자소설 API · 잡코리아 HTTP
+│                                               (조회 기간: 어제·오늘, 월요일은 토·일·월 — 2026-10-26)
 │                                               (on/off는 _enabled_crawlers() 한 곳)
 │                                  extract_job: pending·failed·needs_ocr를 추출(jd_tasks 등 +
 │                                               eligibility). needs_ocr는 OCR(기본 Google Cloud
@@ -87,9 +88,9 @@ AWS EC2 t2.micro — Docker Compose
 v2의 일일 플로우를 유지하되, 수집 단계는 [JD 저장 설계](docs/superpowers/specs/2026-09-24-jd-storage-design.md)대로 원본(`raw_postings`) → 정리(`jobs`) 계층으로 바뀌었다. 코드는 `crawler/`, `analysis/`, `scheduler/`, `bot/`, `db/orm.py`.
 
 - **수집·추출(08:00 체인 1단계, `run_crawl_pipeline`)**: `crawl_job`이 신규 공고를 URL 기준 중복 제거 후 `raw_postings`(원본 그대로)와 `jobs`(`extract_status` 자동 분류)에 저장하고 사이트별 결과를 로그 파일(`logs/<프로그램>.log`, 최근 7일 보관)에 기록 → 이어서 `extract_job`이 JD 요약(`jd_*`)·`eligibility`·근무지(`work_locations`)를 채우고 이미지 JD는 OCR. 크롤러가 마감일을 못 준 공고(인디스워크)는 요약·OCR 본문에 적힌 서류 마감일로 `deadline`을 채운다(2026-10-15, 기존 공고는 `scripts/backfill_deadlines.py`). 실패(`failed`·`needs_ocr`)는 수집한 날 + 다음 날까지만 재시도. 진행 상황(시작·수집 완료·추출 완료·에러)은 Discord 비공개 채널 웹훅으로 전송
-- **분석(체인 2단계)**: 채점 대상은 `extract_status='ok'`이고 아직 점수가 없는 (공고 × 활성 유저) 조합 중, 하는 일(`jd_tasks`)이 비어 있지 않고, 신입 불가(`eligibility.new_grad_ok=false`)가 아니고 근무지(`work_locations`)가 서울·과천·판교·분당 중 하나이거나 미기재인 공고(2026-10-14 결정 — 정보가 없으면 채점, 명시적으로 안 맞는 것만 제외). 조합마다 Gemini Flash가 직무 선택·관문(학력·경력·필수 어학/자격·전공)·항목 점수(직무 방향 30·필수 스택 15·업무 경험 20·우대 20·근거 강도 10·도메인 5)를 매기면 코드가 총점(`fit_score`, 우대사항 없으면 100점 환산, 관문 fail이면 30점 상한)을 계산해 `fit_reasons`·`fit_detail`(JSON)과 함께 저장(2026-10-14). 답을 해석 못 하면 저장하지 않고 다음 실행에 재시도. 근거는 `users.basic_info` + `experiences`를 `analysis/profile.py::build_profile_text()`로 펼친 프로필 텍스트(2026-10-14 전환, 둘 다 비어 있는 유저는 채점 건너뜀). `company_score`는 비활성화(DART/LLM 계산 함수만 보존). 하루 호출 상한 400건을 `extract_job`과 공유(`gemini_usage` 테이블)
+- **분석(체인 2단계, 적합도 채점 v3 2026-10-27)**: 채점 대상은 `extract_status='ok'`이고 아직 점수가 없는 (공고 × 활성 유저) 조합 중, 하는 일(`jd_tasks`)이 비어 있지 않고 신입 불가(`eligibility.new_grad_ok=false`)가 아니며 근무지가 유저 선호(`users.preferences`의 근무지, 없으면 서울·과천·판교·분당)에 맞거나 미기재인 공고. 마감됐거나 이미 점수가 있는 중복 공고는 건너뛴다. 조합마다 Gemini Flash 1회 호출로 관문·항목별 판정(✓/△/✗)·직무 방향만 받고, 점수(`fit_score`)·상태(`status`)·등급은 코드가 계산한다 — 지원 불가·판단 불가는 `fit_score`가 None. 근거는 `users.basic_info` + `experiences`(`analysis/profile.py::build_profile_text()`)와 유저별 지원 조건·직무 방향(`users.preferences`). `company_score`는 비활성화. 하루 호출 상한 400건을 `extract_job`과 공유(`gemini_usage` 테이블)
 - **채점 버전과 재채점(2026-10-15)**: 점수마다 채점에 쓴 `profile_version`(프로필을 고칠 때마다 +1)과 `scorer_version`(`analysis/scorer.py::SCORER_VERSION`, 채점 규칙을 바꾸면 +1)을 남긴다. 둘 중 하나라도 지금 값과 다르면 **구 점수**로 표시만 하고 자동으로 다시 채점하지 않는다. 사용자가 웹(`/dashboard`의 [구 점수 재채점 요청], 공고 상세의 [재채점 요청])에서 요청하면 `rescore_requested_at`이 찍히고, 다음 `analyze_job`이 신규 채점 뒤에 하루 한도 안에서 줄을 지우지 않고 값만 덮어쓴다. 새로 들어오는 공고는 바뀐 프로필로 채점된다
-- **알림(체인 3단계, 이어서 비서 DM)**: 사용자마다 자기 매칭 채널(`users` 테이블의 `match_channel_id` 칸 — 사용자가 그 채널에서 슬래시 명령어 `/매칭채널`로 직접 정한다, `bot/commands.py`. 없으면 그 사용자는 건너뜀 — 공유 채널은 남의 점수가 보여 두지 않는다)에 **아직 안 보낸**(`job_scores.notified_at` 비어 있음) 점수만 보내고, 보낸 뒤 `notified_at`·`notified_as`(card/thread)를 기록한다. 재채점해도 다시 나가지 않는다(2026-10-15, 이전의 "오늘 채점된 것" 기준을 대체). 상위 3개는 카드(제목 `[회사] 직무명 (고용형태)`, 본문 하는 일 + 왜 나랑 맞나, 3버튼 5-2), 나머지는 스레드에 `회사 — 직무 · 점수` 한 줄 링크. fit_score 50점 미만·지원 상태(등록·패스 등)가 있는 공고 제외 (2026-10-15)
+- **알림(체인 3단계, 이어서 비서 DM)**: 사용자마다 자기 매칭 채널(`users` 테이블의 `match_channel_id` 칸 — 사용자가 그 채널에서 슬래시 명령어 `/매칭채널`로 직접 정한다, `bot/commands.py`. 없으면 그 사용자는 건너뜀 — 공유 채널은 남의 점수가 보여 두지 않는다)에 **아직 안 보낸**(`job_scores.notified_at` 비어 있음) 점수만 보내고, 보낸 뒤 `notified_at`·`notified_as`(card/thread)를 기록한다. 재채점해도 다시 나가지 않는다(2026-10-15, 이전의 "오늘 채점된 것" 기준을 대체). 상위 3개는 카드(제목 `[회사] 직무명 (고용형태)`, 본문 하는 일 + 왜 나랑 맞나, 3버튼 5-2), 나머지는 스레드에 `회사 — 직무 · 점수` 한 줄 링크. 등급이 추천·권유(`analysis/grading.py`)인 공고만 보내고 지원 상태(등록·패스 등)가 있는 공고는 제외, 카드·대시보드에 등급 라벨 표시 (2026-10-27)
 - **정리(01:00, `cleanup_job`)**: 마감 지난 `jobs`와 점수·질문·초안 삭제. 패스 외의 `applications`가 있는 공고와 `raw_postings`는 보존(패스만 있는 공고는 그 기록과 함께 삭제)
 - **시각 저장 규칙(2026-10-15)**: 모든 시각 칸은 `db/orm.py::UTCDateTime` — UTC로 저장하고 UTC로 읽는다. SQLite가 시간대를 버려 KST 마감일과 UTC 기록 시각이 섞이던 문제를 고쳤다(기존 마감일은 `scripts/migrate_tracking.py`가 -9시간 보정). D-day·7일째 계산은 한국 날짜 기준(`tracker/lists.py::kst_date`)
 

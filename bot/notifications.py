@@ -4,7 +4,7 @@
 봇 토큰으로 임시 로그인 → 채널 전송 → 로그아웃 방식으로 동작한다. 버튼(목록에 등록·패스)이 있어
 웹훅이 아니라 봇이 보낸다. 지원 현황·리마인드 같은 '비서' 메시지는 DM으로 따로 보낸다(bot/assistant.py).
 
-보내는 대상: 아직 안 보낸(notified_at 비어 있음) 점수 중 MIN_FIT_SCORE 이상이고 지원 상태(등록·패스 등)가 없는 것.
+보내는 대상: 아직 안 보낸(notified_at 비어 있음) 점수 중 등급이 추천·권유(NOTIFY_GRADES)이고 지원 상태(등록·패스 등)가 없는 것.
 보낸 뒤 notified_at·notified_as를 기록하므로 재채점해도 같은 공고가 다시 나가지 않는다(2026-10-15).
 상위 CARD_COUNT건은 카드로, 나머지는 스레드에 한 줄 링크로 넣는다.
 """
@@ -15,6 +15,8 @@ import discord
 
 from sqlalchemy import exists
 
+from analysis.grading import GRADE_LABELS, NOTIFY_GRADES, grade_for
+from analysis.preferences import grade_config
 from db.orm import Application, Job, JobScore, User
 from shared.config import get_settings
 from shared.db import get_session
@@ -22,7 +24,6 @@ from tracker.lists import kst_date
 
 logger = logging.getLogger(__name__)
 
-MIN_FIT_SCORE = 50  # 이 점수 미만 공고는 추천에서 제외
 CARD_COUNT = 3  # 카드로 보여줄 상위 공고 수. 나머지는 스레드에 한 줄씩
 _FIT_SCORE_TIER = 10  # 이 폭 안의 점수는 "비슷함"으로 보고 마감일로 재정렬
 _KST = timezone(timedelta(hours=9))
@@ -49,15 +50,35 @@ def format_job_title(job: Job, score: JobScore | None = None) -> str:
     return f"{base} ({employment_type})" if employment_type else base
 
 
+def grade_label(score: JobScore, job: Job, grade_cfg: dict | None = None, now: datetime | None = None) -> str:
+    """점수 행의 등급 라벨(추천·권유·지원 불가 등)."""
+    grade = grade_for(
+        score.fit_score, score.fit_detail, job.deadline,
+        now or datetime.now(timezone.utc), grade_cfg or grade_config(None),
+    )
+    return GRADE_LABELS[grade]
+
+
+def _preview(text: str) -> str:
+    """카드 칸 길이 제한."""
+    return text[:FIT_REASONS_PREVIEW_LEN] + "…" if len(text) > FIT_REASONS_PREVIEW_LEN else text
+
+
+def score_text(score: JobScore, label: str) -> str:
+    """'82점 · 추천'. 점수가 없으면(지원 불가·판단 불가) 라벨만 — 'None점'이 나오지 않게."""
+    return f"{score.fit_score}점 · {label}" if score.fit_score is not None else label
+
+
 def format_job_message(
-    job: Job, score: JobScore
+    job: Job, score: JobScore, grade_cfg: dict | None = None,
 ) -> tuple[discord.Embed, discord.ui.View]:
     """공고 1건의 Discord Embed와 버튼 View를 반환한다.
 
     카드 본문은 하는 일 + 왜 나랑 맞나만 둔다(2026-10-15 결정). 자격요건·우대사항·스택은
     [자세히 보기]로 원본을 본다.
     """
-    fit = score.fit_score or 0
+    fit = score.fit_score if score.fit_score is not None else 0
+    label = grade_label(score, job, grade_cfg)
 
     if fit >= 80:
         color = discord.Color.green()
@@ -72,7 +93,7 @@ def format_job_message(
         color=color,
     )
 
-    desc_parts = [f"매칭 **{fit}점**"]
+    desc_parts = [f"매칭 **{score_text(score, label)}**"]
     if job.deadline:
         delta = (kst_date(job.deadline) - kst_date(datetime.now(timezone.utc))).days
         desc_parts.append(f"마감 D-{delta}" if delta >= 0 else "마감 지남")
@@ -86,11 +107,16 @@ def format_job_message(
             inline=False,
         )
 
+    # v3부터 맞는 점(fit_reasons)·아쉬운 점(fit_detail.weak_points)을 나눠 받는다. 이전 점수는 한 줄 그대로.
+    detail = score.fit_detail or {}
+    split = "weak_points" in detail
     if score.fit_reasons:
-        reasons = score.fit_reasons
-        if len(reasons) > FIT_REASONS_PREVIEW_LEN:
-            reasons = reasons[:FIT_REASONS_PREVIEW_LEN] + "…"
-        embed.add_field(name="✨ 왜 나랑 맞나", value=reasons, inline=False)
+        embed.add_field(
+            name="✨ 맞는 점" if split else "✨ 왜 나랑 맞나",
+            value=_preview(score.fit_reasons), inline=False,
+        )
+    if split and detail["weak_points"]:
+        embed.add_field(name="⚠️ 아쉬운 점", value=_preview(detail["weak_points"]), inline=False)
 
     view = discord.ui.View()
     view.add_item(discord.ui.Button(
@@ -111,11 +137,11 @@ def format_job_message(
     return embed, view
 
 
-def format_more_line(score: JobScore) -> str:
-    """스레드용 한 줄: '• [회사 — 직무](공고 링크) · 82점'."""
+def format_more_line(score: JobScore, grade_cfg: dict | None = None) -> str:
+    """스레드용 한 줄: '• [회사 — 직무](공고 링크) · 82점 · 추천'."""
     job = score.job
     name = f"{job.company} — {_position(score) or job.title}".replace("[", "(").replace("]", ")")
-    return f"• [{name}]({job.url}) · {score.fit_score}점"
+    return f"• [{name}]({job.url}) · {score_text(score, grade_label(score, job, grade_cfg))}"
 
 
 def chunk_lines(lines: list[str], limit: int = _DISCORD_CONTENT_LIMIT) -> list[str]:
@@ -134,16 +160,22 @@ def chunk_lines(lines: list[str], limit: int = _DISCORD_CONTENT_LIMIT) -> list[s
     return chunks
 
 
-def _unsent_scores(session, user_id: int) -> list[JobScore]:
-    """아직 안 보낸 추천 대상 점수 — fit_score 우선, 점수가 비슷한(10점 단위) 것끼리는 마감 가까운 순."""
+def _unsent_scores(session, user_id: int, grade_cfg: dict | None = None) -> list[JobScore]:
+    """아직 안 보낸 추천 대상 점수 — 등급이 추천·권유인 것만.
+
+    정렬은 fit_score 우선, 점수가 비슷한(10점 단위) 것끼리는 마감 가까운 순. 등급은 점수만으로 SQL에서
+    거를 수 없어 점수 있는 행을 가져온 뒤 파이썬에서 거른다(지원 불가·판단 불가는 점수가 None이라 애초에 제외).
+    """
+    cfg = grade_cfg or grade_config(None)
+    now = datetime.now(timezone.utc)
     has_application = exists().where(
         Application.job_id == JobScore.job_id, Application.user_id == JobScore.user_id,
     )
-    return (
+    rows = (
         session.query(JobScore)
         .join(Job)
         .filter(JobScore.user_id == user_id)
-        .filter(JobScore.fit_score >= MIN_FIT_SCORE)
+        .filter(JobScore.fit_score.isnot(None))
         .filter(JobScore.notified_at.is_(None))
         .filter(~has_application)
         .order_by(
@@ -155,9 +187,15 @@ def _unsent_scores(session, user_id: int) -> list[JobScore]:
         )
         .all()
     )
+    return [
+        r for r in rows
+        if grade_for(r.fit_score, r.fit_detail, r.job.deadline, now, cfg) in NOTIFY_GRADES
+    ]
 
 
-async def _post_recommendations(channel, scores: list[JobScore], day: datetime) -> None:
+async def _post_recommendations(
+    channel, scores: list[JobScore], day: datetime, grade_cfg: dict | None = None,
+) -> None:
     """헤더 → 상위 카드 → (나머지가 있으면) 스레드에 한 줄 링크 목록."""
     label = f"{day.month}월 {day.day}일"
     if not scores:
@@ -166,7 +204,7 @@ async def _post_recommendations(channel, scores: list[JobScore], day: datetime) 
 
     await channel.send(content=f"📬 {label} 추천 공고 — {len(scores)}건")
     for score in scores[:CARD_COUNT]:
-        embed, view = format_job_message(score.job, score)
+        embed, view = format_job_message(score.job, score, grade_cfg)
         await channel.send(embed=embed, view=view)
 
     rest = scores[CARD_COUNT:]
@@ -174,7 +212,7 @@ async def _post_recommendations(channel, scores: list[JobScore], day: datetime) 
         return
     anchor = await channel.send(content=f"➕ 나머지 {len(rest)}건 보기")
     thread = await anchor.create_thread(name=f"{label} 나머지 추천 {len(rest)}건"[:_THREAD_NAME_LIMIT])
-    for chunk in chunk_lines([format_more_line(s) for s in rest]):
+    for chunk in chunk_lines([format_more_line(s, grade_cfg) for s in rest]):
         await thread.send(content=chunk, suppress_embeds=True)
 
 
@@ -209,8 +247,9 @@ async def send_daily_notifications() -> None:
         for user in targets:
             try:
                 channel = await client.fetch_channel(int(user.match_channel_id))
-                scores = _unsent_scores(session, user.id)
-                await _post_recommendations(channel, scores, now.astimezone(_KST))
+                cfg = grade_config(user.preferences)
+                scores = _unsent_scores(session, user.id, cfg)
+                await _post_recommendations(channel, scores, now.astimezone(_KST), cfg)
                 _mark_sent(scores, now)
                 session.commit()
                 logger.info("[notify] user_id=%s 추천 %d건 전송", user.id, len(scores))

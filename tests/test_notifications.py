@@ -10,7 +10,7 @@ import discord
 import pytest
 
 from db.orm import Application, Job, JobScore, User
-from bot.notifications import MIN_FIT_SCORE, format_job_message, send_daily_notifications
+from bot.notifications import format_job_message, send_daily_notifications
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -36,18 +36,21 @@ def _make_job(
 
 
 def _make_score(
-    fit_score: int = 80,
+    fit_score: int | None = 80,
     company_score: int = 70,
     user_id: int = 42,
     fit_reasons: str | None = "Python 경험",
     position: str | None = None,
+    fit_detail: dict | None = None,
 ) -> MagicMock:
     score = MagicMock(spec=JobScore)
     score.fit_score = fit_score
     score.company_score = company_score
     score.user_id = user_id
     score.fit_reasons = fit_reasons
-    score.fit_detail = {"position": position} if position is not None else None
+    score.fit_detail = fit_detail if fit_detail is not None else (
+        {"position": position} if position is not None else None
+    )
     return score
 
 
@@ -297,8 +300,8 @@ async def test_notify_records_what_was_sent_and_never_resends(session):
 
 @pytest.mark.asyncio
 async def test_notify_skips_below_minimum_and_jobs_with_a_status(session):
-    """50점 미만, 이미 등록·패스한 공고는 보내지 않는다."""
-    user = _seed(session, [(80, "NEW"), (MIN_FIT_SCORE - 1, "LOW"), (90, "PASSED")])
+    """권유 기준(70점) 미만, 이미 등록·패스한 공고는 보내지 않는다."""
+    user = _seed(session, [(80, "NEW"), (69, "LOW"), (90, "PASSED")])
     passed = session.query(Job).filter_by(company="PASSED").one()
     session.add(Application(job_id=passed.id, user_id=user.id, status="dismissed"))
     session.commit()
@@ -356,7 +359,7 @@ async def test_notify_orders_by_fit_score_then_deadline_within_similar_tier(sess
     session.add(user)
     session.flush()
 
-    # 90점대 둘(마감만 다름) + 60점대 하나(마감이 제일 가까워도 점수 구간이 낮아 후순위)
+    # 90점대 둘(마감만 다름) + 70점대 하나(마감이 제일 가까워도 점수 구간이 낮아 후순위)
     high_far = Job(source="inthiswork", url="https://ex.com/high-far", title="High/Far",
                    company="A", deadline=now + timedelta(days=20))
     high_soon = Job(source="inthiswork", url="https://ex.com/high-soon", title="High/Soon",
@@ -367,7 +370,7 @@ async def test_notify_orders_by_fit_score_then_deadline_within_similar_tier(sess
     session.flush()
     session.add(JobScore(job_id=high_far.id, user_id=user.id, fit_score=95))
     session.add(JobScore(job_id=high_soon.id, user_id=user.id, fit_score=91))
-    session.add(JobScore(job_id=low_soonest.id, user_id=user.id, fit_score=60))
+    session.add(JobScore(job_id=low_soonest.id, user_id=user.id, fit_score=75))
     session.commit()
 
     sent = []
@@ -378,3 +381,86 @@ async def test_notify_orders_by_fit_score_then_deadline_within_similar_tier(sess
         "https://ex.com/high-far",    # 같은 90점대, 마감 먼 쪽
         "https://ex.com/low-soonest", # 마감은 제일 급해도 점수 구간(60점대)이 낮아 마지막
     ]
+
+
+# ── 등급 기준 알림 (적합도 v3) ───────────────────────────────────────────────
+
+def _set_detail(session, company: str, **detail) -> None:
+    row = session.query(JobScore).join(Job).filter(Job.company == company).one()
+    row.fit_detail = {**(row.fit_detail or {}), **detail}
+    session.commit()
+
+
+@pytest.mark.asyncio
+async def test_mismatch_high_score_is_not_notified(session):
+    """점수가 높아도 직무 방향이 mismatch면 비추천 — 알림 대상이 아니다."""
+    _seed(session, [(95, "MIS"), (85, "OK")])
+    _set_detail(session, "MIS", direction="mismatch")
+    sent = []
+    await _run(session, sent)
+    assert [e.title for e in _cards(sent)] == ["[OK] 직무-OK"]
+
+
+@pytest.mark.asyncio
+async def test_suggest_grade_is_notified(session):
+    """70~79점 + 방향 일치(권유)도 알림 대상이고, 카드에 '권유' 라벨이 붙는다."""
+    _seed(session, [(75, "SUG")])
+    _set_detail(session, "SUG", direction="match")
+    sent = []
+    await _run(session, sent)
+    cards = _cards(sent)
+    assert [e.title for e in cards] == ["[SUG] 직무-SUG"]
+    assert "75점 · 권유" in cards[0].description
+
+
+@pytest.mark.asyncio
+async def test_ineligible_is_not_notified(session):
+    """지원 불가·판단 불가(점수 None)는 알림에 안 나가고 에러도 없다."""
+    _seed(session, [(80, "INEL"), (80, "INS"), (85, "OK")])
+    for company, status in (("INEL", "ineligible"), ("INS", "insufficient")):
+        row = session.query(JobScore).join(Job).filter(Job.company == company).one()
+        row.fit_score = None
+        row.fit_detail = {**row.fit_detail, "status": status}
+    session.commit()
+    sent = []
+    await _run(session, sent)
+    assert [e.title for e in _cards(sent)] == ["[OK] 직무-OK"]
+
+
+@pytest.mark.asyncio
+async def test_user_grade_thresholds_apply(session):
+    """유저별 등급 기준(preferences.grade)을 따른다 — 기준을 85로 올리면 80점은 알림 제외."""
+    user = _seed(session, [(80, "A"), (90, "B")])
+    user.preferences = {"grade": {"recommend_min": 85, "suggest_min": 85}}
+    session.commit()
+    sent = []
+    await _run(session, sent)
+    assert [e.title for e in _cards(sent)] == ["[B] 직무-B"]
+
+
+def test_card_shows_grade_label():
+    embed, _ = format_job_message(_make_job(), _make_score(fit_score=85))
+    assert "85점 · 추천" in embed.description
+
+
+def test_card_without_score_shows_label_not_none():
+    embed, _ = format_job_message(
+        _make_job(), _make_score(fit_score=None, fit_detail={"status": "ineligible"}),
+    )
+    assert "지원 불가" in embed.description
+    assert "None" not in embed.description
+
+
+def test_card_splits_good_and_weak_points_for_v3_scores():
+    score = _make_score(fit_reasons="LLM 경험 일치", fit_detail={"weak_points": "Java 없음"})
+    embed, _ = format_job_message(_make_job(), score)
+    fields = {f.name: f.value for f in embed.fields}
+    assert fields["✨ 맞는 점"] == "LLM 경험 일치"
+    assert fields["⚠️ 아쉬운 점"] == "Java 없음"
+    assert "✨ 왜 나랑 맞나" not in fields
+
+
+def test_card_omits_weak_points_field_when_empty():
+    score = _make_score(fit_reasons="LLM 경험 일치", fit_detail={"weak_points": ""})
+    embed, _ = format_job_message(_make_job(), score)
+    assert [f.name for f in embed.fields if "아쉬운" in f.name] == []

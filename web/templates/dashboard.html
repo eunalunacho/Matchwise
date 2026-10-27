@@ -25,16 +25,16 @@
     <tr><th>회사</th><th>포지션</th><th>출처</th><th>적합도</th><th>지원 상태</th><th></th></tr>
   </thead>
   <tbody>
-    {% for job, score, app, stale in jobs %}
+    {% for job, score, app, stale, grade in jobs %}
     <tr>
       <td>{{ job.company or '-' }}</td>
       <td>{{ job.title or '-' }}</td>
       <td>{{ job.source }}</td>
       <td class="
-        {%- if score and score.fit_score >= 80 %}score-hi
-        {%- elif score and score.fit_score >= 60 %}score-md
+        {%- if score and score.fit_score is not none and score.fit_score >= 80 %}score-hi
+        {%- elif score and score.fit_score is not none and score.fit_score >= 60 %}score-md
         {%- else %}score-lo{%- endif %}">
-        {{ score.fit_score if score else '-' }}
+        {% if not score %}-{% elif score.fit_score is none %}{{ grade }}{% else %}{{ score.fit_score }} <span class="tag">{{ grade }}</span>{% endif %}
         {%- if score and score.rescore_requested_at %} <span class="tag">재채점 대기</span>
         {%- elif stale %} <span class="tag">구 점수</span>{% endif %}
       </td>

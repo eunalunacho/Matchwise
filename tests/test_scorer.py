@@ -240,3 +240,13 @@ def test_summarize_jd_returns_deadline_from_body():
 def test_is_stale_score(profile_version, scorer_version, user_version, stale):
     score = MagicMock(profile_version=profile_version, scorer_version=scorer_version)
     assert is_stale_score(score, user_version) is stale
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("불가", "fail"), ("탈락", "fail"), ("미충족", "fail"), ("✗", "fail"), ("x", "fail"), (" X ", "fail"),
+    ("통과", "pass"), ("충족", "pass"), ("가능", "pass"), ("✓", "pass"), ("o", "pass"), ("O", "pass"),
+    ("PASS", "pass"), ("Fail", "fail"), ("unknown", "unknown"), ("", "unknown"), (None, "unknown"), ("???", "unknown"),
+])
+def test_normalize_gate_value_accepts_korean_and_symbol_aliases(raw, expected):
+    from analysis.scorer import _normalize_gate_value
+    assert _normalize_gate_value(raw) == expected

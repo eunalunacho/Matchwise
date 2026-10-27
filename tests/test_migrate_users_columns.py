@@ -33,9 +33,9 @@ def test_adds_missing_columns_to_legacy_users_table():
 
     added = add_missing_user_columns(engine)
 
-    assert added == ["google_sub", "basic_info"]
+    assert added == ["google_sub", "basic_info", "preferences"]
     columns = {col["name"] for col in inspect(engine).get_columns("users")}
-    assert {"google_sub", "basic_info"}.issubset(columns)
+    assert {"google_sub", "basic_info", "preferences"}.issubset(columns)
 
 
 def test_rerun_is_idempotent():
@@ -55,3 +55,11 @@ def test_noop_when_schema_already_current():
     added = add_missing_user_columns(engine)
 
     assert added == []
+
+
+def test_migration_adds_preferences_column():
+    engine = _make_legacy_engine()
+
+    assert "preferences" in add_missing_user_columns(engine)
+    assert "preferences" in {col["name"] for col in inspect(engine).get_columns("users")}
+    assert add_missing_user_columns(engine) == []

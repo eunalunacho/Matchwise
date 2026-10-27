@@ -31,6 +31,9 @@ from crawler.base import BaseCrawler, RawJob
 from crawler.inthiswork import InthisworkCrawler
 from crawler.jasoseol import JasoseolCrawler
 from crawler.jobkorea import JobkoreaCrawler
+from analysis.dedup import posting_key
+from analysis.grading import _as_utc
+from analysis.preferences import as_list, build_preferences_text, career_of, weights_of
 from analysis.profile import build_profile_text
 from analysis.scorer import SCORER_VERSION, score_fit, summarize_jd
 
@@ -581,26 +584,43 @@ def extract_job() -> dict:
 # 채점 프롬프트에 넣지 않는 basic_info 항목 — 적합도와 무관하고 토큰만 쓴다(2026-10-14 결정).
 _SCORING_EXCLUDED_INFO = ("이름", "링크")
 
-# 채점할 근무지. work_locations 중 하나라도 이 키워드를 포함하면 대상이다.
+# 유저 선호(constraints.work_locations)에 값이 없을 때 쓰는 기본 근무지. work_locations 중 하나라도 이 키워드를 포함하면 대상이다.
 # 판교는 분당구 안이라 "분당"으로도 잡히지만, "성남시 판교로"처럼 구 이름 없이 적힌 주소가 있어 따로 둔다.
 _TARGET_REGION_KEYWORDS = ("서울", "과천", "판교", "분당")
 
 
-def _is_scoring_target(job: Job) -> bool:
+def _is_scoring_target(
+    job: Job, work_locations: list[str] | None = None, max_career_years: float | None = None,
+) -> bool:
     """채점(Gemini 호출) 전에 신입 지원 가능 여부·근무지로 공고를 거른다.
 
     2026-10-14 결정: 판단 정보가 없으면 채점한다 — 명시적으로 안 맞는 공고만 뺀다.
-    - 하는 일(jd_tasks): 비어 있으면 제외. 공고 본문이 없어(이미지만 있는데 OCR 실패 등) 판단 근거가 없는 경우로,
-      그대로 채점하면 LLM이 "명시된 요건이 없으니 다 충족"으로 보고 만점을 준다(2026-10-14 실제 사례).
-    - 신입: eligibility.new_grad_ok가 False(예: "경력 3년 이상 필수")일 때만 제외. 경력무관은 True로 추출된다.
-    - 근무지: work_locations가 있는데 서울·과천·판교·분당이 하나도 없을 때만 제외. 미기재([]/None)는 채점.
+    - 하는 일(jd_tasks)·자격요건(jd_qualifications): 둘 다 비어 있으면 제외. 공고 본문이 없어(이미지만 있는데
+      OCR 실패 등) 판단 근거가 없는 경우다. 담당업무만 없으면 자격요건으로 채점한다(2026-10-27 결정).
+    - 신입: eligibility.new_grad_ok가 False(예: "경력 3년 이상 필수")면 제외. 단 요구 연차(min_years)가
+      max_career_years 이하면 채점한다 — 경력 항목은 비율 점수로 낮게 평가한다(2026-10-27 결정).
+    - 근무지: 공고에 근무지가 있는데 유저가 원하는 근무지(work_locations 인자, 보통 유저 선호의
+      constraints.work_locations)가 하나도 없을 때만 제외. 인자가 None/빈 목록이면 _TARGET_REGION_KEYWORDS
+      (서울·과천·판교·분당)로 폴백한다. 공고의 근무지 미기재([]/None)는 채점.
+
+    Args:
+        job: 추출이 끝난 공고.
+        work_locations: 유저가 원하는 근무지 키워드 목록. None/빈 목록이면 기본 지역.
+        max_career_years: 지원 가능한 최대 요구 연차(유저 선호 constraints.max_required_years). None이면 경력 요구 공고 제외.
+
+    Returns:
+        채점 대상이면 True.
     """
-    if not job.jd_tasks:
+    if not job.jd_tasks and not job.jd_qualifications:
         return False
-    if (job.eligibility or {}).get("new_grad_ok") is False:
-        return False
+    eligibility = job.eligibility or {}
+    if eligibility.get("new_grad_ok") is False:
+        min_years = eligibility.get("min_years")
+        if not (max_career_years and isinstance(min_years, (int, float)) and min_years <= max_career_years):
+            return False
     locations = job.work_locations or []
-    if locations and not any(kw in loc for loc in locations for kw in _TARGET_REGION_KEYWORDS):
+    keywords = tuple(work_locations) if work_locations else _TARGET_REGION_KEYWORDS
+    if locations and not any(kw in loc for loc in locations for kw in keywords):
         return False
     return True
 
@@ -623,6 +643,8 @@ def analyze_job() -> None:
        (공고, 유저) 조합을 채점한다. pending·failed는 카드 내용과 신입 여부를 몰라, needs_ocr/empty는 jd_text가 비어 제외.
     2) 재채점 요청: 사용자가 웹에서 요청한(rescore_requested_at) 점수를 요청 순서대로 다시 채점한다. 줄은 그대로 두고
        값만 덮어쓰므로 notified_at이 유지돼 알림이 다시 나가지 않는다. 오늘 새 추천이 먼저라 신규 다음에 처리한다.
+    신규는 마감 지난 공고와, 같은 공고(analysis/dedup.posting_key)가 이미 그 유저 점수를 가진 경우를 건너뛴다.
+    근무지 관문은 유저 선호의 constraints.work_locations(없으면 기본 지역)를 쓴다. 점수 호출에는 선호 텍스트·가중치를 넘긴다.
     둘 다 하루 Gemini 한도 안에서만 하고, 남은 것은 다음 실행에 이어서 한다.
     프로필이 바뀌어도 기존 점수를 자동으로 다시 채점하지 않는다 — 구 점수로 표시만 된다(2026-10-15 결정).
     유저 쪽 근거는 users.basic_info + experiences(analysis/profile.py) — 둘 다 비어 있으면 그 유저는 건너뛴다.
@@ -647,27 +669,58 @@ def analyze_job() -> None:
             else:
                 logger.warning("[analyze] user_id=%s 이력 없음 — 채점 건너뜀 (scripts/import_profile.py)", user.id)
         users = [user for user in users if user.id in profiles]
+        # 유저별 선호 텍스트·가중치·원하는 근무지 (preferences가 없으면 빈 텍스트·기본값·기본 지역)
+        pref_texts = {u.id: build_preferences_text(u.preferences) for u in users}
+        weights = {u.id: weights_of(u.preferences) for u in users}
+        careers = {u.id: career_of(u.preferences) for u in users}
+        user_locations = {
+            u.id: as_list(((u.preferences or {}).get("constraints") or {}).get("work_locations")) or None
+            for u in users
+        }
         if not users:
             logger.info("[analyze] 이력이 있는 유저 없음, 종료")
             return
 
         extracted = session.query(Job).filter(Job.extract_status == "ok").all()
-        all_jobs = [job for job in extracted if _is_scoring_target(job)]
+        all_jobs = [
+            job for job in extracted
+            if any(_is_scoring_target(job, user_locations[u.id], careers[u.id]["max_years"]) for u in users)
+        ]
         logger.info(
             "[analyze] 추출 완료 %d건 중 신입·근무지 조건 통과 %d건", len(extracted), len(all_jobs),
         )
         total, skipped, failed = 0, 0, 0
         budget_exhausted = False
+        now = datetime.now(timezone.utc)
+        # 같은 공고가 여러 사이트에 올라온 경우를 위해 유저별로 이미 점수가 있는 공고 키를 모아 둔다.
+        scored_keys: dict[int, set[str]] = {u.id: set() for u in users}
+        for uid, company, title in (
+            session.query(JobScore.user_id, Job.company, Job.title)
+            .join(Job, Job.id == JobScore.job_id)
+            .filter(JobScore.user_id.in_(scored_keys))
+            .all()
+        ):
+            key = posting_key(company, title)
+            if key:  # 빈 키는 중복 판단에 쓰지 않는다
+                scored_keys[uid].add(key)
 
         for job in all_jobs:
             if budget_exhausted:
                 break
+            if job.deadline is not None and _as_utc(job.deadline) < now:
+                continue  # 마감된 공고 — 채점도 Gemini 한도도 쓰지 않는다
+            key = posting_key(job.company, job.title)
             for user in users:
+                if not _is_scoring_target(job, user_locations[user.id], careers[user.id]["max_years"]):
+                    continue
                 already = session.query(JobScore).filter_by(
                     job_id=job.id, user_id=user.id
                 ).first()
                 if already:
                     skipped += 1
+                    continue
+                if key and key in scored_keys[user.id]:
+                    skipped += 1  # 같은 공고가 이미 이 유저 점수를 가짐 (다른 사이트 중복)
                     continue
 
                 if _gemini_budget_exhausted(session):
@@ -680,11 +733,17 @@ def analyze_job() -> None:
 
                 try:
                     _record_gemini_call(session)
-                    result = score_fit(jd_text=job.jd_text or "", profile_text=profiles[user.id])
+                    result = score_fit(
+                        jd_text=job.jd_text or "", profile_text=profiles[user.id],
+                        preferences_text=pref_texts[user.id], weights=weights[user.id],
+                        career=careers[user.id],
+                    )
                     row = JobScore(job_id=job.id, user_id=user.id)
                     _apply_score(row, result, user, datetime.now(timezone.utc))
                     session.add(row)
                     session.flush()
+                    if key:
+                        scored_keys[user.id].add(key)
                     total += 1
                     time.sleep(_GEMINI_SLEEP_SEC)
 
@@ -707,10 +766,16 @@ def analyze_job() -> None:
             if budget_exhausted or _gemini_budget_exhausted(session):
                 logger.warning("[analyze] Gemini 한도 도달 — 재채점 요청 %d건은 다음 실행에 처리", len(requests) - rescored)
                 break
+            if row.job.deadline is not None and _as_utc(row.job.deadline) < now:
+                continue  # 마감된 공고 — 재채점도 Gemini 한도를 쓰지 않는다 (요청 표시는 그대로 둠)
             user = users_by_id[row.user_id]
             try:
                 _record_gemini_call(session)
-                result = score_fit(jd_text=row.job.jd_text or "", profile_text=profiles[user.id])
+                result = score_fit(
+                    jd_text=row.job.jd_text or "", profile_text=profiles[user.id],
+                    preferences_text=pref_texts[user.id], weights=weights[user.id],
+                    career=careers[user.id],
+                )
                 _apply_score(row, result, user, datetime.now(timezone.utc))
                 session.flush()
                 rescored += 1
@@ -761,7 +826,7 @@ def assistant_job() -> None:
 # ── 하루 1회 체인 ────────────────────────────────────────────────────────
 
 def run_daily_pipeline() -> None:
-    """08:00 KST — 수집·추출 → 채점 → 매칭 알림 → 비서 DM을 한 번에 이어서 실행한다(2026-10-23 결정).
+    """평일 08:00 KST — 수집·추출 → 채점 → 매칭 알림 → 비서 DM을 한 번에 이어서 실행한다(2026-10-23 결정).
 
     단계마다 고정 시간에 따로 돌던 것(02·05·09시)을 함수 호출 체인으로 합쳤다. 각 단계는 예외를
     안에서 처리하고 돌아오므로, 수집이 멈춰도 이미 쌓인 공고로 채점·알림은 그대로 진행된다.

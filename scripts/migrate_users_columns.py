@@ -1,4 +1,4 @@
-"""users 테이블에 누락된 컬럼(google_sub, basic_info)을 추가하는 1회성 마이그레이션.
+"""users 테이블에 누락된 컬럼(google_sub, basic_info, preferences)을 추가하는 1회성 마이그레이션.
 
 Base.metadata.create_all()(db/init_db.py)은 DB 파일에 없는 테이블만 새로 만들고, 이미 존재하는
 테이블에는 컬럼을 추가하지 못한다. users 테이블은 google_sub/basic_info가 ORM(db/orm.py)에
@@ -16,6 +16,7 @@ from sqlalchemy.engine import Engine
 _NEW_COLUMNS = {
     "google_sub": "VARCHAR(255)",
     "basic_info": "JSON",
+    "preferences": "JSON",
 }
 
 

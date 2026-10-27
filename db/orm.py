@@ -48,6 +48,8 @@ class User(Base):
     resume_text = Column(Text)
     experience_text = Column(Text)
     basic_info = Column(JSON)  # 이름·병역·학력·어학·자격증 등 자유 key-value (DESIGN.md 5-8, scripts/import_profile.py)
+    # 지원 조건·선호(constraints·direction·weights·grade 등). scripts/import_profile.py --preferences로 적재
+    preferences = Column(JSON)
     # resume_text/experience_text는 basic_info+experiences로 대체됨(2026-10-14) — 채점에 쓰지 않는 옛 칸
     # 프로필(basic_info·experiences)을 고칠 때마다 1씩 오른다(analysis/profile.py::mark_profile_changed).
     # 이 값과 다른 버전으로 매긴 job_scores는 "구 점수"로 표시되고, 사용자가 요청할 때만 다시 채점한다.

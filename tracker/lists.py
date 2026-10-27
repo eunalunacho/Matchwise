@@ -11,13 +11,14 @@ from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import exists, or_
 
-from db.orm import Application, ApplicationEvent, Job, JobScore, ResumeDraft
+from analysis.grading import NOTIFY_GRADES, grade_for
+from analysis.preferences import grade_config
+from db.orm import Application, ApplicationEvent, Job, JobScore, ResumeDraft, User
 
 KST = timezone(timedelta(hours=9))
 REMIND_DAYS_LEFT = (7, 2)  # 마감 D-7, D-2에 리마인드
 NO_DEADLINE_REMIND_DAY = 7  # 마감일을 모르는 공고는 등록 후 7일째에 한 번
 MISSED_AFTER_DAYS = 3  # 카드로 보낸 뒤 이 일수가 지나도 반응이 없으면 "놓친 추천"
-MISSED_MIN_FIT_SCORE = 50
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -64,25 +65,32 @@ def deadline_reminders(session, user_id: int, now: datetime) -> list[tuple[Appli
 
 
 def missed_recommendations(session, user_id: int, now: datetime, limit: int = 3) -> list[JobScore]:
-    """카드로 받은 지 MISSED_AFTER_DAYS일이 지났는데 등록·패스 어느 쪽도 안 한, 마감 전 공고. 점수 높은 순."""
+    """카드로 받은 지 MISSED_AFTER_DAYS일이 지났는데 등록·패스 어느 쪽도 안 한, 마감 전 공고. 점수 높은 순.
+
+    추천·권유 등급(알림 대상과 같은 기준, 유저별 등급 기준)만 대상이다. 등급은 SQL로 못 거르니
+    점수 있는 행을 점수 순으로 가져와 파이썬에서 거르고 limit를 적용한다.
+    """
+    user = session.get(User, user_id)
+    cfg = grade_config(user.preferences if user is not None else None)
     has_application = exists().where(
         Application.job_id == JobScore.job_id, Application.user_id == JobScore.user_id,
     )
-    return (
+    rows = (
         session.query(JobScore)
         .join(Job)
         .filter(
             JobScore.user_id == user_id,
             JobScore.notified_as == "card",
             JobScore.notified_at <= now - timedelta(days=MISSED_AFTER_DAYS),
-            JobScore.fit_score >= MISSED_MIN_FIT_SCORE,
+            JobScore.fit_score.isnot(None),
             ~has_application,
             or_(Job.deadline.is_(None), Job.deadline > now),
         )
         .order_by(JobScore.fit_score.desc())
-        .limit(limit)
         .all()
     )
+    notify = [r for r in rows if grade_for(r.fit_score, r.fit_detail, r.job.deadline, now, cfg) in NOTIFY_GRADES]
+    return notify[:limit]
 
 
 def recent_changes(session, user_id: int, since: datetime) -> list[ApplicationEvent]:

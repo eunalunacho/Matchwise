@@ -93,7 +93,7 @@ def build_summary_lines(session, user_id: int, now: datetime) -> list[str]:
     if missed:
         lines.append("\n**놓치고 있는 추천**")
         for score in missed:
-            lines.append(_link_line(score.job, score, f"{score.fit_score}점 · {_deadline_text(score.job.deadline, now)}"))
+            lines.append(_link_line(score.job, score, f"{score.fit_score if score.fit_score is not None else '점수 없음'}{'점' if score.fit_score is not None else ''} · {_deadline_text(score.job.deadline, now)}"))
     return lines
 
 
