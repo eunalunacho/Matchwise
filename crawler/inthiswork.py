@@ -8,7 +8,7 @@ Playwright로 페이지를 긁는 대신 사이트의 공개 REST API(/wp-json/w
   2) GET /tags        태그 이름 → ID      ("IT개발")
   3) GET /posts       조회 기간 + 카테고리 + 태그를 서버에서 필터링한 글 목록 (본문 포함)
 
-대상: 조회 기간(기본 최근 2일, 사이트 로컬 시각=KST)에 게시됐고, 카테고리 "신입/인턴"이며 태그 "IT개발"인 글.
+대상: 조회 기간(오늘 포함, 기본 어제·오늘 / 월요일은 토·일·월, 사이트 로컬 시각=KST)에 게시됐고, 카테고리 "신입/인턴"이며 태그 "IT개발"인 글.
 카테고리 "신입/인턴"은 경력 전용(주니어경력만 붙은 글)과 교육/대외활동·콘텐츠 글을 제외한다.
 
 요청 사이에 1.5초씩 쉬고, 429·5xx·연결 오류는 2번까지 다시 시도한다(2026-10-25 Railway에서 429 — _get 참고).
@@ -23,9 +23,9 @@ import httpx
 from bs4 import BeautifulSoup
 
 from crawler.base import (
-    DEFAULT_LOOKBACK_DAYS,
     BaseCrawler,
     RawJob,
+    default_lookback_days,
     extract_image_urls,
     join_career_level,
 )
@@ -86,7 +86,7 @@ class InthisworkCrawler(BaseCrawler):
 
     def __init__(
         self,
-        lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+        lookback_days: int | None = None,
         client: httpx.Client | None = None,
         today: date | None = None,
         page_size: int = 100,
@@ -95,7 +95,8 @@ class InthisworkCrawler(BaseCrawler):
     ):
         """
         Args:
-            lookback_days: 오늘(KST)로부터 며칠 전까지 게시된 글을 볼지. 2면 그제·어제, 1이면 어제만.
+            lookback_days: 오늘(KST)을 포함해 며칠 전까지 게시된 글을 볼지. 1이면 어제·오늘.
+                없으면 요일로 정한다(base.default_lookback_days).
                 넓혀도 글 목록 호출 횟수는 그대로다 (결과가 page_size를 넘을 때만 페이지 추가).
             client: 테스트용 주입. 없으면 자체 생성하고 종료 시 닫는다.
             today: 테스트용 기준일(KST). 없으면 현재 KST 날짜.
@@ -128,7 +129,8 @@ class InthisworkCrawler(BaseCrawler):
         self, client: httpx.Client, limit: int | None, known_urls: set[str]
     ) -> list[RawJob]:
         today = self._today or datetime.now(KST).date()
-        first_day = today - timedelta(days=self._lookback_days)
+        lookback = self._lookback_days if self._lookback_days is not None else default_lookback_days(today)
+        first_day = today - timedelta(days=lookback)
 
         category_names = self._fetch_taxonomy(client, "categories")
         tag_names = self._fetch_taxonomy(client, "tags")
@@ -145,7 +147,7 @@ class InthisworkCrawler(BaseCrawler):
                     "per_page": self._page_size,
                     "page": page,
                     "after": f"{first_day.isoformat()}T00:00:00",
-                    "before": f"{today.isoformat()}T00:00:00",
+                    "before": f"{(today + timedelta(days=1)).isoformat()}T00:00:00",
                     "categories": category_id,
                     "tags": tag_id,
                     "orderby": "date",

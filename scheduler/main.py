@@ -33,7 +33,8 @@ def main() -> None:
     # 수집·추출 → 채점 → 매칭 알림 → 비서 DM을 한 잡으로 이어서 실행 (scheduler/jobs.py::run_daily_pipeline)
     scheduler.add_job(
         run_daily_pipeline,
-        CronTrigger(hour=settings.schedule.pipeline_hour, minute=0, timezone=tz),
+        # 평일만 — 월요일은 크롤러가 조회 기간을 토·일·월로 넓힌다 (crawler/base.py::default_lookback_days)
+        CronTrigger(day_of_week="mon-fri", hour=settings.schedule.pipeline_hour, minute=0, timezone=tz),
         id="daily_pipeline",
         name="수집 → 추출 → 채점 → 알림",
         max_instances=1,        # 중복 실행 방지
@@ -41,7 +42,7 @@ def main() -> None:
     )
 
     logger.info(
-        "스케줄러 시작 (timezone=%s) — cleanup=%d:00, daily_pipeline=%d:00",
+        "스케줄러 시작 (timezone=%s) — cleanup=%d:00, daily_pipeline=평일 %d:00",
         tz,
         settings.schedule.cleanup_hour,
         settings.schedule.pipeline_hour,

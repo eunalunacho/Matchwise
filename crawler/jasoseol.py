@@ -11,7 +11,7 @@ Playwright 없이 사이트가 내부에서 쓰는 JSON API를 직접 호출한�
 열린 공고 목록(1)의 일부(시작 10/19~23 기준 30건 vs 87건, 목록에 없는 건 0건)였다. 목록은 시작일 필터
 파라미터를 무시하므로 받은 뒤 시작일로 직접 거른다.
 
-대상: 시작일이 조회 기간(기본 최근 2일, KST) 안에 있고, 한 포지션이 채용구분(신입/인턴/신입·경력)과
+대상: 시작일이 조회 기간(오늘 포함, 기본 어제·오늘 / 월요일은 토·일·월, KST) 안에 있고, 한 포지션이 채용구분(신입/인턴/신입·경력)과
 IT 직무를 동시에 만족하는 공고. JD가 이미지면 jd_text는 빈 문자열이고 이미지는 payload에 남는다.
 """
 import logging
@@ -23,9 +23,9 @@ import httpx
 from bs4 import BeautifulSoup
 
 from crawler.base import (
-    DEFAULT_LOOKBACK_DAYS,
     BaseCrawler,
     RawJob,
+    default_lookback_days,
     extract_image_urls,
     join_career_level,
 )
@@ -76,7 +76,7 @@ class JasoseolCrawler(BaseCrawler):
 
     def __init__(
         self,
-        lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+        lookback_days: int | None = None,
         client: httpx.Client | None = None,
         today: date | None = None,
         detail_delay_sec: float = 0.3,
@@ -84,7 +84,8 @@ class JasoseolCrawler(BaseCrawler):
     ):
         """
         Args:
-            lookback_days: 오늘(KST)로부터 며칠 전까지 시작한 공고를 볼지. 2면 그제·어제, 1이면 어제만.
+            lookback_days: 오늘(KST)을 포함해 며칠 전까지 시작한 공고를 볼지. 1이면 어제·오늘.
+                없으면 요일로 정한다(base.default_lookback_days).
             client: 테스트용 주입. 없으면 자체 생성하고 종료 시 닫는다.
             today: 테스트용 기준일(KST). 없으면 현재 KST 날짜.
             detail_delay_sec: 상세 API 호출 사이 대기 (서버 부담 완화).
@@ -112,22 +113,24 @@ class JasoseolCrawler(BaseCrawler):
         self, client: httpx.Client, limit: int | None, known_urls: set[str]
     ) -> list[RawJob]:
         today = self._today or datetime.now(KST).date()
-        first_day = today - timedelta(days=self._lookback_days)
+        lookback = self._lookback_days if self._lookback_days is not None else default_lookback_days(today)
+        first_day = today - timedelta(days=lookback)
 
         it_duty_ids = self._load_it_duty_ids(client)
         items = self._get_json(client.get, LIST_URL, params={"all": "true"})
+        # 기간·직무로 거르기 전 수 — 주말처럼 기간 안 공고가 없는 날도 0이 아니어야 사이트 변화 경고(⚠️)가 맞게 뜬다
+        self.seen_count = len(items)
 
         jobs: list[RawJob] = []
         for item in items:
             started = datetime.fromisoformat(item["start_time"]).astimezone(KST).date()
-            if not first_day <= started < today:
-                continue  # 이전에 시작해 아직 열려 있거나, 시작 예정인 공고
+            if not first_day <= started <= today:
+                continue  # 이전에 시작해 아직 열려 있거나, 내일 이후 시작 예정인 공고
 
             matched = [e for e in item.get("employments", []) if self._matches(e, it_duty_ids)]
             if not matched:
                 continue
 
-            self.seen_count += 1
             url = job_url(item["id"])
             if url in known_urls:
                 continue  # 이미 DB에 있는 공고 — 상세 요청 생략

@@ -1,13 +1,19 @@
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 
 from bs4 import BeautifulSoup
 
-# 신규 공고 조회 기간. 오늘(KST) 기준 며칠 전까지 게시·시작한 공고를 볼지.
-# 2면 그제·어제. 이미 저장된 URL은 known_urls로 건너뛰므로 넓혀도 중복 저장되지 않고,
-# 하루 실행이 실패해도 다음 실행에서 놓친 공고를 복구할 수 있다.
-DEFAULT_LOOKBACK_DAYS = 2
+MONDAY = 0
+
+
+def default_lookback_days(today: date) -> int:
+    """신규 공고 조회 기간 — 오늘(KST)을 포함해 며칠 전까지 게시·시작한 공고를 볼지.
+
+    파이프라인은 평일(월~금)만 돈다. 화~금은 어제·오늘(1), 월요일은 주말을 묶어 토·일·월(2).
+    이미 저장된 URL은 known_urls로 건너뛰므로 기간이 겹쳐도 중복 저장되지 않는다.
+    """
+    return 2 if today.weekday() == MONDAY else 1
 
 # career_level 표기 순서. 구성 요소를 이 순서로 "/"로 잇는다 (예: 신입/인턴/경력).
 CAREER_LEVEL_ORDER = ("신입", "인턴", "경력", "계약직", "교육")

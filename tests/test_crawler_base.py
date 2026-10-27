@@ -1,7 +1,21 @@
 """RawJob 계약 테스트 — 기존 필수 필드는 그대로, 신규 선택 필드는 기본값을 가진다."""
+from datetime import date
+
 import pytest
 
-from crawler.base import RawJob, extract_image_urls, join_career_level
+from crawler.base import RawJob, default_lookback_days, extract_image_urls, join_career_level
+
+
+@pytest.mark.parametrize(
+    ("today", "expected"),
+    [
+        (date(2026, 10, 26), 2),  # 월 → 토·일·월
+        (date(2026, 10, 27), 1),  # 화 → 월·화
+        (date(2026, 10, 30), 1),  # 금 → 목·금
+    ],
+)
+def test_default_lookback_covers_the_weekend_only_on_monday(today, expected):
+    assert default_lookback_days(today) == expected
 
 
 def test_rawjob_required_fields_only_still_works():

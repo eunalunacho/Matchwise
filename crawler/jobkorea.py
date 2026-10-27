@@ -25,9 +25,9 @@ import httpx
 from bs4 import BeautifulSoup
 
 from crawler.base import (
-    DEFAULT_LOOKBACK_DAYS,
     BaseCrawler,
     RawJob,
+    default_lookback_days,
     extract_image_urls,
     join_career_level,
 )
@@ -110,7 +110,7 @@ class JobkoreaCrawler(BaseCrawler):
 
     def __init__(
         self,
-        lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+        lookback_days: int | None = None,
         client: httpx.Client | None = None,
         today: date | None = None,
         request_delay_sec: float = 0.5,
@@ -121,7 +121,8 @@ class JobkoreaCrawler(BaseCrawler):
     ):
         """
         Args:
-            lookback_days: 오늘(KST)로부터 며칠 전까지 등록된 공고를 볼지. 2면 그제·어제.
+            lookback_days: 오늘(KST)을 포함해 며칠 전까지 등록된 공고를 볼지. 1이면 어제·오늘.
+                없으면 요일로 정한다(base.default_lookback_days).
             client: 테스트용 주입. 없으면 자체 생성하고 종료 시 닫는다.
             today: 테스트용 기준일(KST). 없으면 현재 KST 날짜.
             request_delay_sec: 요청 사이 대기 (서버 부담 완화).
@@ -164,7 +165,8 @@ class JobkoreaCrawler(BaseCrawler):
         ③ 페이지에 조회 기간 안의 공고가 하나도 없음 ④ 마지막 페이지.
         """
         today = self._today or datetime.now(KST).date()
-        first_day = today - timedelta(days=self._lookback_days)
+        lookback = self._lookback_days if self._lookback_days is not None else default_lookback_days(today)
+        first_day = today - timedelta(days=lookback)
         base_params = self._load_search_params(client)
 
         jobs: list[RawJob] = []

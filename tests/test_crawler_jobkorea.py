@@ -15,7 +15,7 @@ import pytest
 from crawler.jobkorea import JobkoreaCrawler
 
 KST = timezone(timedelta(hours=9))
-TODAY = date(2026, 9, 26)  # 기본 조회 기간(2일)은 9/24~9/25
+TODAY = date(2026, 9, 26)  # 기본 조회 기간(평일 기준 1일)은 어제·오늘 9/25~9/26
 
 THEME_HTML = """
 <html><body>
@@ -200,7 +200,7 @@ def test_old_posting_is_skipped_without_fetching_its_body_and_paging_continues()
     postings = {
         1: {"detail": _detail(1, posted="2026-09-17")},   # 재등록된 오래된 공고
         2: {"detail": _detail(2, posted="2026-09-25")},
-        3: {"detail": _detail(3, posted="2026-09-24")},   # 그제 (기본 조회 기간 안)
+        3: {"detail": _detail(3, posted="2026-09-26")},   # 오늘 (기본 조회 기간 안)
     }
     jobs, fake = _crawl([[1, 2, 3]], postings=postings)
     assert [j.url for j in jobs] == [_url(2), _url(3)]
@@ -223,7 +223,7 @@ def test_keeps_paging_while_each_page_has_a_recent_posting():
     postings = {
         1: {"detail": _detail(1, posted="2026-09-25")},
         2: {"detail": _detail(2, posted="2026-09-10")},   # 오래된 공고가 섞여 있어도
-        3: {"detail": _detail(3, posted="2026-09-24")},   # 다음 페이지에 최근 공고가 있다
+        3: {"detail": _detail(3, posted="2026-09-26")},   # 다음 페이지에 최근 공고가 있다
     }
     jobs, fake = _crawl([[1, 2], [3]], postings=postings, page_size=2)
     assert [j.url for j in jobs] == [_url(1), _url(3)]
@@ -260,13 +260,23 @@ def test_old_streak_carries_over_to_the_next_page():
     assert sorted(fake.detail_requests()) == [1, 2, 3, 4, 5]   # 오래된 4건(2~5)에서 중단, 6은 열지 않는다
 
 
-def test_lookback_of_one_day_is_yesterday_only():
+def test_default_window_is_yesterday_and_today():
+    postings = {
+        1: {"detail": _detail(1, posted="2026-09-26")},
+        2: {"detail": _detail(2, posted="2026-09-25")},
+        3: {"detail": _detail(3, posted="2026-09-24")},
+    }
+    jobs, _ = _crawl([[1, 2, 3]], postings=postings)
+    assert [j.url for j in jobs] == [_url(1), _url(2)]
+
+
+def test_lookback_days_overrides_the_default_window():
     postings = {
         1: {"detail": _detail(1, posted="2026-09-25")},
         2: {"detail": _detail(2, posted="2026-09-24")},
     }
-    jobs, _ = _crawl([[1, 2]], postings=postings, lookback_days=1)
-    assert [j.url for j in jobs] == [_url(1)]
+    jobs, _ = _crawl([[1, 2]], postings=postings, lookback_days=2)
+    assert [j.url for j in jobs] == [_url(1), _url(2)]
 
 
 def test_posting_without_posted_date_is_kept():

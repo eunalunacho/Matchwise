@@ -12,7 +12,7 @@ import httpx
 from crawler.jasoseol import JasoseolCrawler
 
 KST = timezone(timedelta(hours=9))
-TODAY = date(2026, 9, 24)  # "어제"는 2026-09-23
+TODAY = date(2026, 9, 24)  # 목요일. "어제"는 2026-09-23
 
 # IT(94) > 웹개발(162) > 프론트엔드(175) / 경영·사무(91) > 기획·전략·경영(103) > 경영기획(109)
 DUTY_GROUPS = [
@@ -121,22 +121,26 @@ def test_lookback_does_not_add_requests():
 def test_only_postings_started_within_lookback_are_kept():
     items = [
         _list_item(1, [_emp(11, 1, IT_DUTY)], start="2026-09-23"),  # 어제 시작
-        _list_item(2, [_emp(21, 1, IT_DUTY)], start="2026-09-22"),  # 그제 시작 (기본 조회 기간 안)
-        _list_item(3, [_emp(31, 1, IT_DUTY)], start="2026-09-21"),  # 3일 전 (아직 열려 있는 이전 공고)
+        _list_item(2, [_emp(21, 1, IT_DUTY)], start="2026-09-22"),  # 그제 시작 (아직 열려 있는 이전 공고)
         _list_item(4, [_emp(41, 1, IT_DUTY)], start="2026-09-24"),  # 오늘 시작
         _list_item(5, [_emp(51, 1, IT_DUTY)], start="2026-09-26"),  # 시작 예정 (목록에 미리 올라온 것)
     ]
     jobs, _ = _crawl(items)
-    assert [j.url.rsplit("=", 1)[1] for j in jobs] == ["1", "2"]
+    assert [j.url.rsplit("=", 1)[1] for j in jobs] == ["1", "4"]
 
 
-def test_lookback_of_one_day_keeps_only_yesterdays_postings():
+def test_monday_keeps_postings_started_over_the_weekend():
     items = [
-        _list_item(1, [_emp(11, 1, IT_DUTY)], start="2026-09-23"),
-        _list_item(2, [_emp(21, 1, IT_DUTY)], start="2026-09-22"),
+        _list_item(1, [_emp(11, 1, IT_DUTY)], start="2026-09-25"),  # 금
+        _list_item(2, [_emp(21, 1, IT_DUTY)], start="2026-09-26"),  # 토
+        _list_item(3, [_emp(31, 1, IT_DUTY)], start="2026-09-27"),  # 일
+        _list_item(4, [_emp(41, 1, IT_DUTY)], start="2026-09-28"),  # 월 (오늘)
     ]
-    jobs, _ = _crawl(items, lookback_days=1)
-    assert [j.url.rsplit("=", 1)[1] for j in jobs] == ["1"]
+    fake = FakeJasoseol(items, None, ())
+    crawler = JasoseolCrawler(client=httpx.Client(transport=httpx.MockTransport(fake)), today=date(2026, 9, 28),
+                              detail_delay_sec=0)
+    jobs = crawler.fetch_jobs()
+    assert [j.url.rsplit("=", 1)[1] for j in jobs] == ["2", "3", "4"]
 
 
 # ── 채용구분 · 직무 필터 ───────────────────────────────────────────────────
@@ -296,11 +300,16 @@ def test_detail_failure_skips_only_that_posting():
 # ── 수집 요약용 카운터 (로그·웹훅) ─────────────────────────────────────────
 
 def test_counts_seen_and_detail_failed_postings():
-    """기간·채용구분·IT 조건을 통과한 공고는 이미 아는 것도 '본 수'에 들어가고, 상세 실패는 따로 센다."""
+    """'본 수'는 목록 API가 준 전체 수(기간·직무로 거르기 전), 상세 실패는 따로 센다.
+
+    기간 안 공고가 없는 날(주말)에도 0이 아니어야 사이트 변화 경고가 잘못 뜨지 않는다 (2026-10-26).
+    """
     items = [
         _list_item(1, [_emp(11, 1, IT_DUTY)]),
         _list_item(2, [_emp(21, 1, IT_DUTY)]),
         _list_item(3, [_emp(31, 1, IT_DUTY)]),
+        _list_item(4, [_emp(41, 1, IT_DUTY)], start="2026-09-01"),  # 기간 밖
+        _list_item(5, [_emp(51, 1, NON_IT_DUTY)]),                  # IT 아님
     ]
     fake = FakeJasoseol(items, None, {3})
     crawler = JasoseolCrawler(
@@ -309,5 +318,5 @@ def test_counts_seen_and_detail_failed_postings():
     jobs = crawler.fetch_jobs(known_urls={"https://jasoseol.com/recruit?ec=1"})
 
     assert [j.url for j in jobs] == ["https://jasoseol.com/recruit?ec=2"]
-    assert crawler.seen_count == 3
+    assert crawler.seen_count == 5
     assert crawler.detail_failed_count == 1

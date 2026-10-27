@@ -14,7 +14,7 @@ import pytest
 
 from crawler.inthiswork import InthisworkCrawler, _split_title
 
-TODAY = date(2026, 9, 24)  # "어제"는 2026-09-23
+TODAY = date(2026, 9, 24)  # 목요일. "어제"는 2026-09-23
 
 CAT_NEW, CAT_JUNIOR, CAT_EDU = 191700167, 191700168, 191700345
 TAG_IT, TAG_STARTUP = 191700187, 191700265
@@ -135,18 +135,22 @@ def test_filters_by_category_and_tag_ids_resolved_from_names():
     assert params["tags"] == str(TAG_IT)
 
 
-def test_default_window_covers_the_last_two_days_in_site_local_time():
+def test_default_window_covers_yesterday_and_today_in_site_local_time():
     _, fake = _crawl([_post(1)])
     params = fake.post_params()[0]
-    assert params["after"] == "2026-09-22T00:00:00"
-    assert params["before"] == "2026-09-24T00:00:00"
-
-
-def test_lookback_of_one_day_is_yesterday_only():
-    _, fake = _crawl([_post(1)], lookback_days=1)
-    params = fake.post_params()[0]
     assert params["after"] == "2026-09-23T00:00:00"
-    assert params["before"] == "2026-09-24T00:00:00"
+    assert params["before"] == "2026-09-25T00:00:00"
+
+
+def test_monday_window_covers_the_weekend():
+    fake = FakeInthiswork([_post(1)])
+    crawler = InthisworkCrawler(
+        client=httpx.Client(transport=httpx.MockTransport(fake)), today=date(2026, 9, 28), sleep=lambda _: None
+    )
+    crawler.fetch_jobs()
+    params = fake.post_params()[0]
+    assert params["after"] == "2026-09-26T00:00:00"   # 토
+    assert params["before"] == "2026-09-29T00:00:00"  # 월요일 끝까지
 
 
 def test_lookback_days_widens_window_without_extra_requests():
