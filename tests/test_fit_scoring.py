@@ -58,10 +58,10 @@ def _score(data, profile_text="프로필", **kwargs) -> dict:
 
 # ── 버전·프롬프트 ───────────────────────────────────────────────────────
 
-def test_scorer_version_is_3():
-    assert SCORER_VERSION == 3
-    assert not is_stale_score(SimpleNamespace(scorer_version=3, profile_version=1), 1)
-    assert is_stale_score(SimpleNamespace(scorer_version=2, profile_version=1), 1)
+def test_scorer_version_is_4():
+    assert SCORER_VERSION == 4
+    assert not is_stale_score(SimpleNamespace(scorer_version=4, profile_version=1), 1)
+    assert is_stale_score(SimpleNamespace(scorer_version=3, profile_version=1), 1)
 
 
 def test_prompt_takes_jd_profile_and_preferences():
@@ -76,6 +76,14 @@ def test_prompt_has_item_rules_and_no_total_score():
     for key in GATE_KEYS:
         assert key in text
     assert "총점은 계산하지 않" in text
+
+
+def test_prompt_marks_gate_sentences_as_n():
+    """학력·전공·신입/경력 무관·입사 시점 같은 관문 문장은 required·preferred 어디에 있든 N (2026-10-30 결정)."""
+    text = "\n".join(m.prompt.template for m in _FIT_PROMPT.messages)
+    assert "관문 문장" in text
+    for word in ("대학교 졸업 이상", "관련 전공", "신입·경력", "입사 가능"):
+        assert word in text
 
 
 def test_prompt_renders_with_empty_preferences():
