@@ -58,10 +58,10 @@ def _score(data, profile_text="프로필", **kwargs) -> dict:
 
 # ── 버전·프롬프트 ───────────────────────────────────────────────────────
 
-def test_scorer_version_is_4():
-    assert SCORER_VERSION == 4
-    assert not is_stale_score(SimpleNamespace(scorer_version=4, profile_version=1), 1)
-    assert is_stale_score(SimpleNamespace(scorer_version=3, profile_version=1), 1)
+def test_scorer_version_is_5():
+    assert SCORER_VERSION == 5
+    assert not is_stale_score(SimpleNamespace(scorer_version=5, profile_version=1), 1)
+    assert is_stale_score(SimpleNamespace(scorer_version=4, profile_version=1), 1)
 
 
 def test_prompt_takes_jd_profile_and_preferences():
@@ -113,7 +113,22 @@ def test_preferences_text_defaults_to_empty():
 
 def test_category_points():
     assert CATEGORY_POINTS == {"required": 50, "preferred": 20, "tasks": 30}
-    assert GATE_KEYS == ("degree", "graduation", "career", "language", "cert")
+    assert GATE_KEYS == ("degree", "graduation", "career", "language", "cert", "military")
+
+
+def test_prompt_gates_military_service_only_postings():
+    """전문연구요원·산업기능요원으로만 뽑는 공고는 병역 비대상이면 지원 불가, '편입 가능'은 아님 (2026-11-02)."""
+    text = "\n".join(m.prompt.template for m in _FIT_PROMPT.messages)
+    for word in ("military", "전문연구요원", "산업기능요원", "편입 가능"):
+        assert word in text
+
+
+def test_military_gate_fail_is_ineligible():
+    gate = {"military": "fail", "fail_reason": "고용형태: 전문연구요원"}
+    result = _score(_answer(gate=gate))
+    assert result["fit_score"] is None
+    assert result["fit_detail"]["status"] == "ineligible"
+    assert result["fit_detail"]["gate"]["military"] == "fail"
 
 
 def test_score_is_weighted_sum_of_category_rates():
@@ -197,7 +212,7 @@ def test_gate_values_are_normalized():
     gate = {"degree": "PASS", "graduation": " Fail ", "career": "모름", "fail_reason": None}
     detail = _score(_answer(gate=gate))["fit_detail"]
     assert detail["gate"] == {"degree": "pass", "graduation": "fail", "career": "unknown", "language": "unknown",
-                              "cert": "unknown", "fail_reason": ""}
+                              "cert": "unknown", "military": "unknown", "fail_reason": "", "location": "unknown"}
 
 
 @pytest.mark.parametrize("overrides", [
@@ -354,3 +369,52 @@ def test_legacy_fit_reasons_still_used_when_good_points_missing():
     result = _score(_answer())
     assert result["fit_reasons"] == "LLM 에이전트 경험 일치, Java는 부족"
     assert result["fit_detail"]["weak_points"] == ""
+
+
+# ── 직무별 근무지 (2026-11-02) ──────────────────────────────────────────
+# 여러 직무를 한 공고에 뽑을 때 공고 전체 근무지에 서울이 있어도, 고른 직무의 근무지가
+# 원하는 지역 밖이면 지원 불가. (예: 한국알프스 — 기술영업은 서울, AI/DX/AX Engineer는 광주 본사)
+
+_SEOUL_AREA = ["서울", "과천", "판교", "분당"]
+
+
+def test_prompt_asks_for_position_location():
+    text = "\n".join(m.prompt.template for m in _FIT_PROMPT.messages)
+    assert "position_location" in text
+
+
+def test_position_location_outside_wanted_area_is_ineligible():
+    result = _score(_answer(position_location="광주 광산구 하남산단5번로 33"), work_locations=_SEOUL_AREA)
+    detail = result["fit_detail"]
+    assert result["fit_score"] is None
+    assert detail["status"] == "ineligible"
+    assert detail["gate"]["location"] == "fail"
+    assert detail["gate"]["fail_reason"] == "근무지: 광주 광산구 하남산단5번로 33"
+    assert detail["position_location"] == "광주 광산구 하남산단5번로 33"
+
+
+def test_position_location_inside_wanted_area_is_scored():
+    result = _score(_answer(position_location="서울 서초구 강남대로 213"), work_locations=_SEOUL_AREA)
+    assert result["fit_detail"]["status"] == "scored"
+    assert result["fit_detail"]["gate"]["location"] == "pass"
+
+
+@pytest.mark.parametrize("loc", ["", None])
+def test_missing_position_location_is_not_judged(loc):
+    """직무별 근무지가 없으면(공고 공통·미기재) 판정하지 않는다 — 공고 단위 근무지는 채점 전에 이미 걸렀다."""
+    result = _score(_answer(position_location=loc), work_locations=_SEOUL_AREA)
+    assert result["fit_detail"]["status"] == "scored"
+    assert result["fit_detail"]["gate"]["location"] == "unknown"
+
+
+def test_position_location_not_judged_without_work_locations():
+    result = _score(_answer(position_location="광주 광산구"))
+    assert result["fit_detail"]["status"] == "scored"
+    assert result["fit_detail"]["gate"]["location"] == "unknown"
+
+
+def test_existing_gate_fail_reason_is_kept_over_location():
+    gate = {"degree": "fail", "fail_reason": "석사 이상"}
+    result = _score(_answer(gate=gate, position_location="광주 광산구"), work_locations=_SEOUL_AREA)
+    assert result["fit_detail"]["gate"]["fail_reason"] == "석사 이상"
+    assert result["fit_detail"]["gate"]["location"] == "fail"

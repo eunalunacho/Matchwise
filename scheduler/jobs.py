@@ -644,7 +644,7 @@ def analyze_job() -> None:
     2) 재채점 요청: 사용자가 웹에서 요청한(rescore_requested_at) 점수를 요청 순서대로 다시 채점한다. 줄은 그대로 두고
        값만 덮어쓰므로 notified_at이 유지돼 알림이 다시 나가지 않는다. 오늘 새 추천이 먼저라 신규 다음에 처리한다.
     신규는 마감 지난 공고와, 같은 공고(analysis/dedup.posting_key)가 이미 그 유저 점수를 가진 경우를 건너뛴다.
-    근무지 관문은 유저 선호의 constraints.work_locations(없으면 기본 지역)를 쓴다. 점수 호출에는 선호 텍스트·가중치를 넘긴다.
+    근무지 관문은 유저 선호의 constraints.work_locations(없으면 기본 지역)를 쓴다 — 채점 전엔 공고 근무지로, 채점 때는 고른 직무의 근무지로 한 번 더 본다. 점수 호출에는 선호 텍스트·가중치를 넘긴다.
     둘 다 하루 Gemini 한도 안에서만 하고, 남은 것은 다음 실행에 이어서 한다.
     프로필이 바뀌어도 기존 점수를 자동으로 다시 채점하지 않는다 — 구 점수로 표시만 된다(2026-10-15 결정).
     유저 쪽 근거는 users.basic_info + experiences(analysis/profile.py) — 둘 다 비어 있으면 그 유저는 건너뛴다.
@@ -737,6 +737,7 @@ def analyze_job() -> None:
                         jd_text=job.jd_text or "", profile_text=profiles[user.id],
                         preferences_text=pref_texts[user.id], weights=weights[user.id],
                         career=careers[user.id],
+                        work_locations=list(user_locations[user.id] or _TARGET_REGION_KEYWORDS),
                     )
                     row = JobScore(job_id=job.id, user_id=user.id)
                     _apply_score(row, result, user, datetime.now(timezone.utc))
@@ -775,6 +776,7 @@ def analyze_job() -> None:
                     jd_text=row.job.jd_text or "", profile_text=profiles[user.id],
                     preferences_text=pref_texts[user.id], weights=weights[user.id],
                     career=careers[user.id],
+                    work_locations=list(user_locations[user.id] or _TARGET_REGION_KEYWORDS),
                 )
                 _apply_score(row, result, user, datetime.now(timezone.utc))
                 session.flush()

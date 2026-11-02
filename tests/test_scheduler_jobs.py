@@ -1469,6 +1469,22 @@ def test_analyze_passes_preferences_text_and_weights_to_score_fit(session):
     assert "병역: 비대상" in kwargs["preferences_text"]
     assert kwargs["weights"]["department_preferred"] == 0.1
     assert kwargs["career"] == {"months": 6.0, "max_years": 2.0}
+    # 선호에 근무지가 없으면 기본 지역으로 직무별 근무지를 판정한다
+    assert kwargs["work_locations"] == ["서울", "과천", "판교", "분당"]
+
+
+def test_analyze_passes_user_work_locations_to_score_fit(session):
+    prefs = {"constraints": {"work_locations": ["서울", "판교"]}}
+    user = User(discord_id="1", username="u", is_active=True, basic_info=_PROFILE, preferences=prefs)
+    session.add_all([user, _ok_job("https://a.com/1")])
+    session.commit()
+
+    with patch("scheduler.jobs.get_session", return_value=session), \
+         patch("scheduler.jobs.score_fit", return_value={"fit_score": 1, "fit_reasons": ""}) as mock_score, \
+         patch("scheduler.jobs.time.sleep"):
+        analyze_job()
+
+    assert mock_score.call_args.kwargs["work_locations"] == ["서울", "판교"]
 
 
 def test_analyze_passes_preferences_to_rescore_too(session):

@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 CATEGORY_POINTS: dict[str, int] = {"required": 50, "preferred": 20, "tasks": 30}
 # 관문 — 하나라도 fail이면 지원 불가(ineligible), 점수 없음. 근무지·마감은 코드가 따로 본다.
 #   degree 학위 / graduation 졸업(예정) 시한 / career 필수 경력 / language 주 사용 언어 / cert 필수 어학·자격
-GATE_KEYS = ("degree", "graduation", "career", "language", "cert")
+GATE_KEYS = ("degree", "graduation", "career", "language", "cert", "military")
 
 # 판정 문자 → 값. N(판단 불가)은 분모에서 뺀다.
 _VERDICT_VALUES: dict[str, float] = {"O": 1.0, "H": 0.5, "X": 0.0}
@@ -49,7 +49,9 @@ _REQUIRED_KINDS = ("normal", "career")
 #   2: 짧은 직무명(position)·한 줄 fit_reasons(2026-10-15)
 #   3: 항목 판정 + 코드 계산·등급, 경력 비율 점수, 맞는 점·아쉬운 점 분리(2026-10-27)
 #   4: 관문 문장(학력·전공·신입/경력 무관·입사 시점)도 N — 필수 점수에서 제외(2026-10-30)
-SCORER_VERSION = 4
+#   5: 고른 직무의 근무지(position_location)가 원하는 지역 밖이면 지원 불가, 병역특례(전문연구요원·산업기능요원)
+#      전용 공고는 병역 비대상·군필이면 지원 불가(관문 military)(2026-11-02)
+SCORER_VERSION = 5
 
 
 def is_stale_score(score, user_profile_version: int) -> bool:
@@ -81,6 +83,9 @@ _FIT_PROMPT = ChatPromptTemplate.from_messages([
    번호, 문장 어미, 회사명, "채용"·"모집"·"신입" 같은 말은 뺀다.
    예: "1. IT 서비스 시스템 운영 및 개발 업무를 담당해요." → "IT 서비스 운영·개발"
        "[데이블] Jr. ML Engineer 머신러닝 엔지니어 채용 (신입)" → "Jr. ML Engineer"
+   position_location은 고른 직무의 근무지다. 직무별로 근무지가 따로 적혀 있으면 그 직무의 근무지를 시/도부터 쓴다.
+   "본사"·"공장"처럼 줄여 적었으면 공고의 근무지 주소 목록에서 찾아 풀어 쓴다 (예: "광주 (본사)" → "광주 광산구 하남산단5번로 33").
+   모든 직무가 같은 근무지이거나 근무지가 적혀 있지 않으면 빈 문자열.
 
 2. 정보 충분성 (info_sufficient)
    담당업무와 자격요건이 둘 다 없거나, 본문이 비어 있거나 이미지·별도 파일이라 내용을 읽을 수 없으면 false.
@@ -92,6 +97,12 @@ _FIT_PROMPT = ChatPromptTemplate.from_messages([
    - career: 필수 경력 연차 — [지원 조건·선호]의 허용 경력(max_required_years)을 넘을 때만 "fail". 그 이하면 "pass"
    - language: 메인·필수 프로그래밍 언어 (코딩테스트 언어 포함)
    - cert: 필수 어학 점수·필수 자격증
+   - military: 병역특례 전용 채용 — [지원자 사실]의 병역이 비대상·군필·면제인데, 공고가 전문연구요원·산업기능요원만
+     뽑는다고 명시하면 "fail". 명시란 다음 중 하나다: 고용형태가 전문연구요원·산업기능요원 (예: "고용형태: 전문연구요원"),
+     지원자격·필수 요건에 병역특례 대상·복무 가능자가 들어 있음 (예: "전문연구요원으로 복무 가능한 분", "병역특례 대상자"),
+     직무명이 병역특례 채용 (예: "[전문연구요원] 백엔드 개발자", "산업기능요원 모집").
+     "전문연구요원 편입 가능", "신규 편입 및 전직이 가능합니다", "산업기능요원으로 채용이 가능한 포지션"처럼
+     병역특례를 선택지로만 안내하면 일반 지원자와 함께 뽑는 것이므로 "pass". 병역특례 언급이 없으면 "unknown".
    [지원 조건·선호]에 적힌 지원 조건(졸업 시한, 허용 경력, 학위, 사용 언어 등)을 공고 조건과 대조해 판정한다.
    그 블록이 비어 있으면 공고 조건과 [지원자 사실]만 대조한다.
    "fail"은 공고가 명시한 조건을 지원자가 확실히 충족하지 못할 때만 쓴다. 공고에 조건이 없거나 판단할 수 없으면 "unknown".
@@ -146,7 +157,7 @@ _FIT_PROMPT = ChatPromptTemplate.from_messages([
   예: good_points "LLM 에이전트·GCP 경험이 우대사항과 일치", weak_points "Java 실무 경험 없음"
 
 아래 JSON 형식으로만 답하세요:
-{{"position": "<직무>", "info_sufficient": <true|false>, "gate": {{"degree": "pass|fail|unknown", "graduation": "pass|fail|unknown", "career": "pass|fail|unknown", "language": "pass|fail|unknown", "cert": "pass|fail|unknown", "fail_reason": "<원문 또는 빈 문자열>"}}, "required": [{{"item": "<공고 문구>", "verdict": "O|H|X|N", "kind": "normal|career", "years": <경력 항목만 숫자>, "evidence": "<근거 경험>"}}], "preferred": [{{"item": "<공고 문구>", "verdict": "O|H|X|N", "kind": "normal|department|vague", "evidence": "<근거 경험>"}}], "tasks": [{{"item": "<공고 문구>", "verdict": "O|H|X|N", "evidence": "<근거 경험>"}}], "direction": {{"verdict": "match|partial|mismatch", "reason": "<이유>"}}, "good_points": "<맞는 점>", "weak_points": "<아쉬운 점>"}}
+{{"position": "<직무>", "position_location": "<고른 직무의 근무지 또는 빈 문자열>", "info_sufficient": <true|false>, "gate": {{"degree": "pass|fail|unknown", "graduation": "pass|fail|unknown", "career": "pass|fail|unknown", "language": "pass|fail|unknown", "cert": "pass|fail|unknown", "military": "pass|fail|unknown", "fail_reason": "<원문 또는 빈 문자열>"}}, "required": [{{"item": "<공고 문구>", "verdict": "O|H|X|N", "kind": "normal|career", "years": <경력 항목만 숫자>, "evidence": "<근거 경험>"}}], "preferred": [{{"item": "<공고 문구>", "verdict": "O|H|X|N", "kind": "normal|department|vague", "evidence": "<근거 경험>"}}], "tasks": [{{"item": "<공고 문구>", "verdict": "O|H|X|N", "evidence": "<근거 경험>"}}], "direction": {{"verdict": "match|partial|mismatch", "reason": "<이유>"}}, "good_points": "<맞는 점>", "weak_points": "<아쉬운 점>"}}
 """),
 ])
 
@@ -360,8 +371,21 @@ def _category_rate(items: list[dict], weights: dict[str, float]) -> float | None
     return earned / total if total > 0 else None
 
 
+def _location_gate(position_location: str, work_locations: list[str] | None) -> str:
+    """고른 직무의 근무지 → "pass"/"fail"/"unknown".
+
+    여러 직무를 한 공고에 뽑으면 공고 근무지 목록에 원하는 지역이 섞여 채점 전 거르기를 통과한다
+    (예: 기술영업은 서울, AI 직무는 광주 본사). 그래서 고른 직무의 근무지를 한 번 더 본다.
+    근무지나 원하는 지역 목록이 없으면 판정하지 않는다.
+    """
+    if not position_location or not work_locations:
+        return "unknown"
+    return "pass" if any(kw in position_location for kw in work_locations) else "fail"
+
+
 def _compute_fit_score(
     data: dict, weights: dict[str, float], career: dict | None = None,
+    work_locations: list[str] | None = None,
 ) -> tuple[int | None, dict]:
     """LLM 판정(관문·항목·방향) → (점수, fit_detail).
 
@@ -374,6 +398,8 @@ def _compute_fit_score(
         weights: 우대 kind별 가중치 (analysis/preferences.py::weights_of).
         career: 경력 설정 {"months", "max_years"} (analysis/preferences.py::career_of). None이면 기본값.
             경력 항목은 months ÷ (요구 연차×12)로 점수를 주고, 요구 연차가 max_years를 넘으면 관문 fail.
+        work_locations: 원하는 근무지 키워드. 고른 직무의 근무지(position_location)에 하나도 없으면
+            gate["location"] = "fail"(지원 불가). None/빈 목록이면 판정하지 않는다.
 
     Returns:
         (0~100 정수 또는 None, fit_detail dict).
@@ -403,12 +429,16 @@ def _compute_fit_score(
     if over:
         gate["career"] = "fail"
         gate["fail_reason"] = gate["fail_reason"] or over[0]["item"]
+    position_location = str(data.get("position_location") or "").strip()
+    gate["location"] = _location_gate(position_location, work_locations)
+    if gate["location"] == "fail":
+        gate["fail_reason"] = gate["fail_reason"] or f"근무지: {position_location}"
 
     info_sufficient = data.get("info_sufficient")
     if isinstance(info_sufficient, str):
         info_sufficient = info_sufficient.strip().lower() != "false"
 
-    if any(gate[key] == "fail" for key in GATE_KEYS):
+    if any(gate[key] == "fail" for key in (*GATE_KEYS, "location")):
         status = "ineligible"
     elif info_sufficient is False or (rates["required"] is None and rates["tasks"] is None):
         status = "insufficient"
@@ -424,6 +454,7 @@ def _compute_fit_score(
     direction, direction_reason = _normalize_direction(data.get("direction"))
     detail = {
         "position": str(data.get("position") or ""),
+        "position_location": position_location,
         "status": status,
         "gate": gate,
         **categories,
@@ -441,6 +472,7 @@ def score_fit(
     preferences_text: str = "",
     weights: dict[str, float] | None = None,
     career: dict | None = None,
+    work_locations: list[str] | None = None,
 ) -> dict:
     """JD × 지원자 사실 × 지원 조건·선호 → fit_score(코드 계산) + fit_reasons + fit_detail.
 
@@ -453,6 +485,7 @@ def score_fit(
         preferences_text: [지원 조건·선호] 블록 텍스트.
         weights: 우대 kind별 가중치. None이면 기본값(weights_of(None)).
         career: 경력 비율 점수 설정. None이면 기본값(career_of(None) — 비율 계산 없이 판정 그대로).
+        work_locations: 원하는 근무지 키워드. 고른 직무의 근무지가 밖이면 지원 불가. None이면 판정 안 함.
 
     Returns:
         {"fit_score": int | None, "fit_reasons": str, "fit_detail": dict}. 지원 불가·판단 불가면 fit_score None.
@@ -468,7 +501,7 @@ def score_fit(
     })
     data = _parse_json(_response_text(response))
     total, detail = _compute_fit_score(
-        data, weights if weights is not None else weights_of(None), career,
+        data, weights if weights is not None else weights_of(None), career, work_locations,
     )
     return {
         "fit_score": total,
