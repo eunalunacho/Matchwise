@@ -12,10 +12,17 @@ from crawler.base import RawJob, default_lookback_days, extract_image_urls, join
         (date(2026, 10, 26), 2),  # 월 → 토·일·월
         (date(2026, 10, 27), 1),  # 화 → 월·화
         (date(2026, 10, 30), 1),  # 금 → 목·금
+        (date(2026, 10, 31), 1),  # 토 → 금·토 (금요일 8시 이후 공고)
     ],
 )
 def test_default_lookback_covers_the_weekend_only_on_monday(today, expected):
     assert default_lookback_days(today) == expected
+
+
+def test_pipeline_runs_monday_to_saturday():
+    """일요일만 쉰다 — 토요일 실행이 금요일 8시 이후 공고를 잡는다(2026-11-06)."""
+    from scheduler.main import PIPELINE_DAYS
+    assert PIPELINE_DAYS == "mon-sat"
 
 
 def test_rawjob_required_fields_only_still_works():

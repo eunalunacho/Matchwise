@@ -44,10 +44,10 @@ AWS EC2 t2.micro — Docker Compose
 │
 ├─ Layer 1. 파이프라인  (v2 승계 — 일반 코드, 에이전트 아님)
 │    scheduler (APScheduler)
-│      평일 08:00 → run_daily_pipeline: run_crawl_pipeline (crawl_job → extract_job 순차 함수 호출, 워크플로우 체인 —
+│      월~토 08:00 → run_daily_pipeline: run_crawl_pipeline (crawl_job → extract_job 순차 함수 호출, 워크플로우 체인 —
 │                                  고정 시간에 따로 도는 게 아니라 크롤링이 끝나면 바로 추출로 이어짐)
 │                                  crawl_job:   인디스워크 WordPress API · 자소설 API · 잡코리아 HTTP
-│                                               (조회 기간: 어제·오늘, 월요일은 토·일·월 — 2026-10-26)
+│                                               (조회 기간: 어제·오늘, 월요일은 토·일·월 — 2026-10-26. 일요일만 쉼 — 2026-11-06)
 │                                               (on/off는 _enabled_crawlers() 한 곳)
 │                                  extract_job: pending·failed·needs_ocr를 추출(jd_tasks 등 +
 │                                               eligibility). needs_ocr는 OCR(기본 Google Cloud
