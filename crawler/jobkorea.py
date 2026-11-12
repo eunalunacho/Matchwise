@@ -91,6 +91,18 @@ def _parse_deadline(value) -> datetime | None:
     return moment if moment.tzinfo else moment.replace(tzinfo=KST)
 
 
+# 잡코리아 상시 공고는 validThrough에 '수집일+1년'을 넣는다(2026-11-12 실측: 11/12 수집 → 2027-11-11).
+# 이만큼 먼 마감일은 실제 마감이 아니라 상시로 본다.
+_PLACEHOLDER_DEADLINE_DAYS = 300
+
+
+def _drop_placeholder_deadline(deadline: datetime | None, today: date) -> datetime | None:
+    """상시 공고의 자리표시 마감일(오늘+300일 이후)은 None — 마감일 없음(채용 시 마감)."""
+    if deadline is not None and deadline.date() > today + timedelta(days=_PLACEHOLDER_DEADLINE_DAYS):
+        return None
+    return deadline
+
+
 def _career_level(experience: str, employment: str) -> str:
     """JSON-LD의 경력 조건과 고용형태에서 career_level을 만든다."""
     levels = set()
@@ -313,7 +325,9 @@ class JobkoreaCrawler(BaseCrawler):
             title=card.title,
             company=card.company,
             jd_text=body.get_text(separator="\n", strip=True),
-            deadline=_parse_deadline(json_ld.get("validThrough")),
+            deadline=_drop_placeholder_deadline(
+                _parse_deadline(json_ld.get("validThrough")), self._today or datetime.now(KST).date(),
+            ),
             apply_url=None,
             payload={
                 "card": {

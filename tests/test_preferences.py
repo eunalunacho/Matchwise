@@ -75,3 +75,16 @@ def test_career_of_reads_months_and_max_years():
 def test_career_of_defaults_when_missing():
     assert career_of(None) == {"months": 0.0, "max_years": None}
     assert career_of({"constraints": {"career_months": "모름"}}) == {"months": 0.0, "max_years": None}
+
+
+def test_fit_text_without_direction_list_but_with_picked_position():
+    """방향을 따로 판정하면(2026-11-11) 채점 프롬프트에는 방향 목록을 넣지 않고, 고른 직무만 알려 준다."""
+    text = build_preferences_text(PREFS, include_direction=False, picked_position="AI 서비스 개발")
+    assert "크롤링·데이터 수집만 하는 직무" not in text
+    assert "직무 방향" not in text
+    assert "방향 판정에서 고른 직무: AI 서비스 개발" in text
+    assert "Python" in text
+
+
+def test_no_picked_position_line_when_empty():
+    assert "방향 판정에서 고른 직무" not in build_preferences_text(PREFS, include_direction=False)

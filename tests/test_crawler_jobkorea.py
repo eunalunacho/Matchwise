@@ -311,6 +311,18 @@ def test_missing_valid_through_gives_no_deadline():
     assert jobs[0].deadline is None
 
 
+def test_far_future_valid_through_is_always_open():
+    """잡코리아 상시 공고는 validThrough에 '수집일+1년'을 넣는다 (11/12 실측: 2027-11-11) — 마감일 없음으로 본다."""
+    far = (TODAY + timedelta(days=365)).isoformat() + "T00:00"
+    jobs, _ = _crawl([[1]], postings={1: {"detail": _detail(1, valid_through=far)}})
+    assert jobs[0].deadline is None
+
+
+def test_deadline_within_months_is_kept():
+    jobs, _ = _crawl([[1]], postings={1: {"detail": _detail(1, valid_through="2027-01-10T23:59")}})
+    assert jobs[0].deadline == datetime(2027, 1, 10, 23, 59, tzinfo=KST)
+
+
 def test_unparseable_valid_through_gives_no_deadline():
     jobs, _ = _crawl([[1]], postings={1: {"detail": _detail(1, valid_through="상시채용")}})
     assert jobs[0].deadline is None

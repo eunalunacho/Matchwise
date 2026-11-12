@@ -7,6 +7,8 @@
 보내는 대상: 아직 안 보낸(notified_at 비어 있음) 점수 중 등급이 추천·권유(NOTIFY_GRADES)이고 지원 상태(등록·패스 등)가 없는 것.
 보낸 뒤 notified_at·notified_as를 기록하므로 재채점해도 같은 공고가 다시 나가지 않는다(2026-10-15).
 상위 CARD_COUNT건은 카드로, 나머지는 스레드에 한 줄 링크로 넣는다.
+순서는 등급(추천 → 권유) → 고용형태(analysis/employment.py, 유저 선호 employment_priority) → 점수대 → 마감 가까운 순(2026-11-11).
+직무 방향 목록 어디에도 해당하지 않은 공고(분류 안 됨)는 추천과 섞지 않고 뒤에 한 줄 목록으로 따로 보낸다(2026-11-11).
 """
 import logging
 from datetime import datetime, timedelta, timezone
@@ -15,6 +17,7 @@ import discord
 
 from sqlalchemy import exists
 
+from analysis.employment import DEFAULT_ORDER, employment_order, employment_rank
 from analysis.grading import GRADE_LABELS, NOTIFY_GRADES, grade_for
 from analysis.preferences import grade_config
 from db.orm import Application, Job, JobScore, User
@@ -160,37 +163,85 @@ def chunk_lines(lines: list[str], limit: int = _DISCORD_CONTENT_LIMIT) -> list[s
     return chunks
 
 
-def _unsent_scores(session, user_id: int, grade_cfg: dict | None = None) -> list[JobScore]:
-    """아직 안 보낸 추천 대상 점수 — 등급이 추천·권유인 것만.
-
-    정렬은 fit_score 우선, 점수가 비슷한(10점 단위) 것끼리는 마감 가까운 순. 등급은 점수만으로 SQL에서
-    거를 수 없어 점수 있는 행을 가져온 뒤 파이썬에서 거른다(지원 불가·판단 불가는 점수가 None이라 애초에 제외).
-    """
-    cfg = grade_cfg or grade_config(None)
-    now = datetime.now(timezone.utc)
+def _unsent_query(session, user_id: int):
+    """아직 안 보냈고 지원 상태(등록·패스 등)도 없는 이 유저의 점수 행."""
     has_application = exists().where(
         Application.job_id == JobScore.job_id, Application.user_id == JobScore.user_id,
     )
-    rows = (
+    return (
         session.query(JobScore)
         .join(Job)
         .filter(JobScore.user_id == user_id)
-        .filter(JobScore.fit_score.isnot(None))
         .filter(JobScore.notified_at.is_(None))
         .filter(~has_application)
-        .order_by(
-            # SQLAlchemy의 `/`는 실수 나눗셈으로 강제 변환되어(예: 91/10=9.1) 타이어링이
-            # 깨지므로, .op("/")로 SQLite의 정수 나눗셈(91/10=9)을 그대로 쓴다.
-            JobScore.fit_score.op("/")(_FIT_SCORE_TIER).desc(),
-            Job.deadline.asc().nullslast(),
-            JobScore.fit_score.desc(),
-        )
-        .all()
     )
+
+
+def _unsent_scores(
+    session, user_id: int, grade_cfg: dict | None = None, order: tuple[str, ...] = DEFAULT_ORDER,
+) -> list[JobScore]:
+    """아직 안 보낸 추천 대상 점수 — 등급이 추천·권유인 것만.
+
+    정렬: 등급(추천 → 권유) → 고용형태 순위(order) → 점수대(10점 단위, 높은 순) → 마감 가까운 순 → 점수.
+    등급은 점수만으로 SQL에서 거를 수 없어 점수 있는 행을 가져온 뒤 파이썬에서 거르고 정렬한다
+    (지원 불가·판단 불가·방향에서 걸러진 행은 점수가 None이라 애초에 제외).
+    """
+    cfg = grade_cfg or grade_config(None)
+    now = datetime.now(timezone.utc)
+    graded = [
+        (grade_for(r.fit_score, r.fit_detail, r.job.deadline, now, cfg), r)
+        for r in _unsent_query(session, user_id).filter(JobScore.fit_score.isnot(None)).all()
+    ]
+    picked = [(grade, r) for grade, r in graded if grade in NOTIFY_GRADES]
+
+    def key(pair):
+        grade, row = pair
+        deadline = row.job.deadline
+        return (
+            NOTIFY_GRADES.index(grade),
+            employment_rank(row.job.jd_employment_type, order),
+            -(row.fit_score // _FIT_SCORE_TIER),
+            deadline is None,
+            _as_aware(deadline) if deadline is not None else now,
+            -row.fit_score,
+        )
+
+    return [row for _, row in sorted(picked, key=key)]
+
+
+def _as_aware(dt: datetime) -> datetime:
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _unsent_unclassified(session, user_id: int) -> list[JobScore]:
+    """아직 안 보낸 '분류 안 됨' 행(직무 방향 목록에 없는 공고). 마감된 공고는 뺀다."""
+    now = datetime.now(timezone.utc)
+    rows = _unsent_query(session, user_id).filter(JobScore.fit_score.is_(None)).all()
     return [
         r for r in rows
-        if grade_for(r.fit_score, r.fit_detail, r.job.deadline, now, cfg) in NOTIFY_GRADES
+        if (r.fit_detail or {}).get("status") == "unclassified"
+        and (r.job.deadline is None or _as_aware(r.job.deadline) >= now)
     ]
+
+
+def format_unclassified_line(score: JobScore) -> str:
+    """분류 안 된 공고 한 줄: '• [회사 — 직무](링크) · 이유'."""
+    job = score.job
+    detail = score.fit_detail or {}
+    name = f"{job.company} — {_position(score) or job.title}".replace("[", "(").replace("]", ")")
+    reason = str(detail.get("direction_reason") or "").strip()
+    return f"• [{name}]({job.url})" + (f" · {reason}" if reason else "")
+
+
+async def _post_unclassified(channel, scores: list[JobScore]) -> None:
+    """분류 안 된 공고를 한 줄 목록으로 보낸다. 원하는 직무면 방향 목록에 줄을 추가하라는 안내를 붙인다."""
+    if not scores:
+        return
+    header = (f"🗂 분류 안 된 공고 {len(scores)}건 — 직무 방향 목록에 해당하는 줄이 없어요. "
+              "원하는 직무면 목록에 추가해 주세요.")
+    lines = [header] + [format_unclassified_line(s) for s in scores]
+    for chunk in chunk_lines(lines):
+        await channel.send(content=chunk, suppress_embeds=True)
 
 
 async def _post_recommendations(
@@ -248,11 +299,16 @@ async def send_daily_notifications() -> None:
             try:
                 channel = await client.fetch_channel(int(user.match_channel_id))
                 cfg = grade_config(user.preferences)
-                scores = _unsent_scores(session, user.id, cfg)
+                scores = _unsent_scores(session, user.id, cfg, employment_order(user.preferences))
+                unclassified = _unsent_unclassified(session, user.id)
                 await _post_recommendations(channel, scores, now.astimezone(_KST), cfg)
+                await _post_unclassified(channel, unclassified)
                 _mark_sent(scores, now)
+                for row in unclassified:
+                    row.notified_at, row.notified_as = now, "unclassified"
                 session.commit()
-                logger.info("[notify] user_id=%s 추천 %d건 전송", user.id, len(scores))
+                logger.info("[notify] user_id=%s 추천 %d건 · 분류 안 됨 %d건 전송",
+                            user.id, len(scores), len(unclassified))
             except Exception:
                 session.rollback()
                 logger.exception("[notify] user_id=%s 채널 전송 실패", user.id)

@@ -4,7 +4,7 @@
 잡 함수의 분기 로직(중복 제외, 실패 격리 등)만 검증한다.
 """
 from datetime import date, datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -440,7 +440,7 @@ def test_extract_job_ocrs_needs_ocr_then_extracts(session):
         extract_job()
 
     mock_ocr.assert_called_once_with("https://img.example.com/jd.png")
-    mock_sum.assert_called_once_with("OCR로 뽑은 담당업무 텍스트", hints=None)
+    mock_sum.assert_called_once_with("OCR로 뽑은 담당업무 텍스트", hints=None, reference_date=ANY)
     updated = session.query(Job).filter_by(url="https://j.com/1").first()
     assert updated.jd_text == "OCR로 뽑은 담당업무 텍스트"  # raw_postings는 안 건드리고 jobs만 채움
     assert updated.extract_status == "ok"
@@ -1087,7 +1087,7 @@ def test_extract_job_passes_hints_from_matching_raw_posting(session):
          patch("scheduler.jobs.time.sleep"):
         extract_job()
 
-    mock_sum.assert_called_once_with("본문", hints={"positions": [{"career_level": "신입"}]})
+    mock_sum.assert_called_once_with("본문", hints={"positions": [{"career_level": "신입"}]}, reference_date=ANY)
 
 
 def test_extract_job_passes_none_hints_when_no_matching_raw_posting(session):
@@ -1103,7 +1103,7 @@ def test_extract_job_passes_none_hints_when_no_matching_raw_posting(session):
          patch("scheduler.jobs.time.sleep"):
         extract_job()
 
-    mock_sum.assert_called_once_with("본문", hints=None)
+    mock_sum.assert_called_once_with("본문", hints=None, reference_date=ANY)
 
 
 def test_extract_job_stops_when_daily_gemini_budget_exhausted(session):
@@ -1885,3 +1885,138 @@ def test_analyze_job_work_locations_bare_string_is_one_keyword(session):
 
     assert mock_score.call_count == 1
     assert session.query(JobScore).one().job_id == seoul_id
+
+
+# ── 직무 방향 1차 판정 (2026-11-11) ──────────────────────────────────────
+
+_DIRECTION_PREFS = {
+    "constraints": {"병역": "비대상"},
+    "direction": {"match": ["LLM·에이전트 개발"], "mismatch": ["CS·QA·운영 지원 중심"]},
+}
+
+
+def _direction(verdict, line="M1", position="AI 서비스 개발"):
+    return {"direction": verdict, "line": line, "line_text": "줄", "evidence": "업무", "position": position,
+            "reason": "이유"}
+
+
+def _direction_user(session, prefs=None):
+    user = User(discord_id="1", username="u", is_active=True, basic_info=_PROFILE,
+                preferences=prefs if prefs is not None else _DIRECTION_PREFS)
+    session.add_all([user, _ok_job("https://a.com/1")])
+    session.commit()
+    return user
+
+
+def _usage(session) -> int:
+    usage = session.query(GeminiUsage).filter_by(usage_date=date.today()).first()
+    return usage.call_count if usage else 0
+
+
+@pytest.mark.parametrize("verdict, line", [("mismatch", "X1"), ("unclassified", "NONE")])
+def test_analyze_skips_fit_scoring_when_direction_filters_out(session, verdict, line):
+    """불일치·분류 안 됨이면 채점(2번째 Gemini 호출)을 하지 않고 방향만 저장한다."""
+    _direction_user(session)
+    with patch("scheduler.jobs.get_session", return_value=session), \
+         patch("scheduler.jobs.judge_direction", return_value=_direction(verdict, line)) as judge, \
+         patch("scheduler.jobs.score_fit") as mock_score, \
+         patch("scheduler.jobs.time.sleep"):
+        analyze_job()
+
+    judge.assert_called_once_with("본문", _DIRECTION_PREFS["direction"])
+    mock_score.assert_not_called()
+    saved = session.query(JobScore).one()
+    assert saved.fit_score is None
+    assert saved.fit_detail["status"] == verdict
+    assert saved.fit_detail["direction"] == verdict
+    assert saved.fit_detail["direction_line"] == line
+    assert saved.fit_detail["position"] == "AI 서비스 개발"
+    assert _usage(session) == 1
+
+
+def test_analyze_scores_fit_with_judged_direction_and_no_direction_list(session):
+    _direction_user(session)
+    judged = _direction("match")
+    with patch("scheduler.jobs.get_session", return_value=session), \
+         patch("scheduler.jobs.judge_direction", return_value=judged), \
+         patch("scheduler.jobs.score_fit", return_value=_RESULT) as mock_score, \
+         patch("scheduler.jobs.time.sleep"):
+        analyze_job()
+
+    kwargs = mock_score.call_args.kwargs
+    assert kwargs["direction"] == judged
+    assert "LLM·에이전트 개발" not in kwargs["preferences_text"]  # 채점 LLM은 방향 목록을 보지 않는다
+    assert "방향 판정에서 고른 직무: AI 서비스 개발" in kwargs["preferences_text"]
+    assert "병역: 비대상" in kwargs["preferences_text"]
+    assert session.query(JobScore).one().fit_score == 77
+    assert _usage(session) == 2
+
+
+def test_analyze_without_direction_list_makes_one_call_as_before(session):
+    _direction_user(session, prefs={"constraints": {"병역": "비대상"}})
+    with patch("scheduler.jobs.get_session", return_value=session), \
+         patch("scheduler.jobs.judge_direction") as judge, \
+         patch("scheduler.jobs.score_fit", return_value=_RESULT) as mock_score, \
+         patch("scheduler.jobs.time.sleep"):
+        analyze_job()
+
+    judge.assert_not_called()
+    assert mock_score.call_args.kwargs["direction"] is None
+    assert _usage(session) == 1
+
+
+def test_analyze_saves_nothing_when_budget_runs_out_between_direction_and_fit(session):
+    """방향 판정 뒤 한도가 차면 저장하지 않는다 — 다음 실행에 방향부터 다시 한다."""
+    _direction_user(session)
+    session.add(GeminiUsage(usage_date=date.today(), call_count=_GEMINI_DAILY_CAP - 1))
+    session.commit()
+    with patch("scheduler.jobs.get_session", return_value=session), \
+         patch("scheduler.jobs.judge_direction", return_value=_direction("match")), \
+         patch("scheduler.jobs.score_fit") as mock_score, \
+         patch("scheduler.jobs.time.sleep"):
+        analyze_job()
+
+    mock_score.assert_not_called()
+    assert session.query(JobScore).count() == 0
+
+
+def test_analyze_does_not_save_when_direction_judgement_fails(session):
+    _direction_user(session)
+    with patch("scheduler.jobs.get_session", return_value=session), \
+         patch("scheduler.jobs.judge_direction", side_effect=ValueError("방향 판정 답 없음")), \
+         patch("scheduler.jobs.score_fit") as mock_score, \
+         patch("scheduler.jobs.time.sleep"):
+        analyze_job()
+
+    mock_score.assert_not_called()
+    assert session.query(JobScore).count() == 0
+
+
+def test_rescore_also_judges_direction_first(session):
+    user, _, row = _scored_pair(session, fit_score=50, rescore_requested_at=datetime(2026, 10, 15, 3, 0))
+    user.preferences = _DIRECTION_PREFS
+    session.commit()
+    with patch("scheduler.jobs.get_session", return_value=session), \
+         patch("scheduler.jobs.judge_direction", return_value=_direction("mismatch", "X1")), \
+         patch("scheduler.jobs.score_fit") as mock_score, \
+         patch("scheduler.jobs.time.sleep"):
+        analyze_job()
+
+    mock_score.assert_not_called()
+    saved = session.query(JobScore).one()
+    assert saved.fit_score is None
+    assert saved.fit_detail["status"] == "mismatch"
+    assert saved.rescore_requested_at is None
+
+
+def test_extract_job_passes_crawl_date_in_kst_as_deadline_reference(session):
+    """마감일 연도는 수집일(한국 날짜) 기준으로 정한다 (2026-11-12 결정)."""
+    session.add(Job(source="inthiswork", url="https://a.com/r", title="t", company="c", jd_text="본문",
+                    extract_status="pending", crawled_at=datetime(2026, 12, 22, 23, 30, tzinfo=timezone.utc)))
+    session.commit()
+    with patch("scheduler.jobs.get_session", return_value=session), \
+         patch("scheduler.jobs.summarize_jd", return_value=_TASK_SUMMARY) as mock_sum, \
+         patch("scheduler.jobs.time.sleep"):
+        extract_job()
+
+    assert mock_sum.call_args.kwargs["reference_date"] == date(2026, 12, 23)  # UTC 12/22 23:30 = KST 12/23

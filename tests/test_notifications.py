@@ -464,3 +464,88 @@ def test_card_omits_weak_points_field_when_empty():
     score = _make_score(fit_reasons="LLM 경험 일치", fit_detail={"weak_points": ""})
     embed, _ = format_job_message(_make_job(), score)
     assert [f.name for f in embed.fields if "아쉬운" in f.name] == []
+
+
+# ── 고용형태 순서·분류 안 된 공고 (2026-11-11) ─────────────────────────────
+
+def _seed_rows(session, rows, prefs=None) -> User:
+    """rows: (회사, 점수, 고용형태, fit_detail)."""
+    user = User(username="tester", is_active=True, match_channel_id=CHANNEL_ID, preferences=prefs)
+    session.add(user)
+    session.flush()
+    for company, fit, employment, detail in rows:
+        job = Job(source="a", url=f"https://ex.com/{company}", title=f"공고 {company}", company=company,
+                  jd_employment_type=employment)
+        session.add(job)
+        session.flush()
+        session.add(JobScore(job_id=job.id, user_id=user.id, fit_score=fit, fit_reasons="이유",
+                             fit_detail=detail or {"position": f"직무-{company}", "status": "scored",
+                                                   "direction": "match"}))
+    session.commit()
+    return user
+
+
+@pytest.mark.asyncio
+async def test_notify_orders_same_grade_by_employment_type(session):
+    """같은 등급 안에서는 정규직 > 채용전환형 인턴 > 체험형 인턴 6개월+ > 계약직 순. 점수보다 먼저 본다."""
+    _seed_rows(session, [
+        ("계약", 95, "계약직 (1년)", None),
+        ("인턴", 90, "인턴 (6개월)", None),
+        ("정규", 82, "정규직", None),
+        ("전환", 85, "정규직 전환형 인턴 (3개월)", None),
+        ("권유정규", 75, "정규직", None),
+    ])
+    sent = []
+    await _run(session, sent)
+
+    titles = [e.title for e in _cards(sent)]
+    assert titles == ["[정규] 직무-정규 (정규직)", "[전환] 직무-전환 (정규직 전환형 인턴 (3개월))",
+                      "[인턴] 직무-인턴 (인턴 (6개월))"]
+    thread_text = "\n".join(kw["content"] for where, kw in sent if where == "thread")
+    # 추천(계약직)이 권유(정규직)보다 먼저 — 등급이 우선
+    assert thread_text.index("계약") < thread_text.index("권유정규")
+
+
+@pytest.mark.asyncio
+async def test_notify_employment_order_comes_from_preferences(session):
+    _seed_rows(session, [("정규", 90, "정규직", None), ("계약", 85, "계약직", None)],
+               prefs={"employment_priority": ["계약직", "정규직"]})
+    sent = []
+    await _run(session, sent)
+    assert [e.title.split("]")[0] for e in _cards(sent)] == ["[계약", "[정규"]
+
+
+_UNCLASSIFIED = {"position": "IDC Assistant", "status": "unclassified", "direction": "unclassified",
+                 "direction_reason": "데이터센터 현장 업무 — 목록에 없음", "direction_line": "NONE"}
+
+
+@pytest.mark.asyncio
+async def test_notify_lists_unclassified_postings_separately_once(session):
+    _seed_rows(session, [("추천", 90, "정규직", None), ("토스", None, "단기계약직", _UNCLASSIFIED),
+                         ("불일치", None, "정규직", {"position": "CS", "status": "mismatch", "direction": "mismatch"})])
+    sent = []
+    await _run(session, sent)
+
+    assert [e.title.split("]")[0] for e in _cards(sent)] == ["[추천"]
+    texts = [kw["content"] or "" for where, kw in sent if where == "channel"]
+    block = next(t for t in texts if "분류 안 된 공고 1건" in t)
+    assert "• [토스 — IDC Assistant](https://ex.com/토스) · 데이터센터 현장 업무 — 목록에 없음" in block
+    assert "불일치" not in "\n".join(texts)  # 불일치는 보내지 않는다
+
+    rows = {s.job.company: s for s in session.query(JobScore).all()}
+    assert rows["토스"].notified_as == "unclassified"
+    assert rows["불일치"].notified_at is None
+
+    again = []
+    await _run(session, again)
+    assert not any("분류 안 된 공고" in (kw["content"] or "") for _, kw in again)
+
+
+@pytest.mark.asyncio
+async def test_notify_sends_unclassified_even_without_recommendations(session):
+    _seed_rows(session, [("토스", None, "", _UNCLASSIFIED)])
+    sent = []
+    await _run(session, sent)
+    texts = [kw["content"] or "" for where, kw in sent if where == "channel"]
+    assert "새 추천 공고 없음" in texts[0]
+    assert any("분류 안 된 공고 1건" in t for t in texts)

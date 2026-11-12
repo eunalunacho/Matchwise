@@ -1,11 +1,13 @@
 """적합도 등급. 저장된 점수 행(fit_score, fit_detail, 마감일)에서 읽을 때 계산한다."""
 from datetime import datetime, timezone
 
-GRADES = ("closed", "ineligible", "insufficient", "recommend", "suggest", "reference", "not_recommended")
+GRADES = ("closed", "ineligible", "insufficient", "unclassified",
+          "recommend", "suggest", "reference", "not_recommended")
 GRADE_LABELS = {
     "closed": "마감",
     "ineligible": "지원 불가",
     "insufficient": "판단 불가",
+    "unclassified": "분류 안 됨",  # 직무 방향 목록 어디에도 해당하지 않음 — 따로 알려 사람이 판단 (2026-11-11)
     "recommend": "추천",
     "suggest": "권유",
     "reference": "참고",
@@ -28,7 +30,7 @@ def grade_for(
 ) -> str:
     """점수 행의 등급을 계산한다.
 
-    순서: 마감 경과 -> 지원 불가 -> 판단 불가 -> 점수/방향 규칙.
+    순서: 마감 경과 -> 지원 불가 -> 방향 판정 단계 결과(불일치·분류 안 됨, 점수 없음) -> 판단 불가 -> 점수/방향 규칙.
     방향(direction)이 없거나 빈 값이면(v2 행 등) 점수만으로 매긴다.
 
     Args:
@@ -47,6 +49,11 @@ def grade_for(
     status = detail.get("status")
     if status == "ineligible":
         return "ineligible"
+    # 방향 판정(analysis/direction.py)에서 걸러져 채점을 건너뛴 행 — 점수가 없다
+    if status == "mismatch":
+        return "not_recommended"
+    if status == "unclassified":
+        return "unclassified"
     if status == "insufficient" or fit_score is None:
         return "insufficient"
 

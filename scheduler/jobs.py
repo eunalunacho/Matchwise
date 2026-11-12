@@ -32,6 +32,7 @@ from crawler.inthiswork import InthisworkCrawler
 from crawler.jasoseol import JasoseolCrawler
 from crawler.jobkorea import JobkoreaCrawler
 from analysis.dedup import posting_key
+from analysis.direction import UNCLASSIFIED, direction_options, judge_direction
 from analysis.grading import _as_utc
 from analysis.preferences import as_list, build_preferences_text, career_of, weights_of
 from analysis.profile import build_profile_text
@@ -529,7 +530,7 @@ def extract_job() -> dict:
 
             try:
                 _record_gemini_call(session)
-                summary = summarize_jd(job.jd_text or "", hints=hints)
+                summary = summarize_jd(job.jd_text or "", hints=hints, reference_date=_crawl_date_kst(job))
                 # 텍스트가 한 줄(회사명·접수기한 등)이라도 있으면 pending으로 분류되지만 본문은 이미지인 공고가 있다
                 # (2026-10-14 실제 사례). 요약에 하는 일·자격요건이 모두 비고 이미지가 있으면 OCR로 보완해 다시 요약한다.
                 if (not summary["tasks"] and not summary["qualifications"] and ocr_url
@@ -544,7 +545,7 @@ def extract_job() -> dict:
                         job.jd_text = f"{job.jd_text or ''}\n\n{ocr_text}".strip()
                         time.sleep(_GEMINI_SLEEP_SEC)
                         _record_gemini_call(session)
-                        summary = summarize_jd(job.jd_text, hints=hints)
+                        summary = summarize_jd(job.jd_text, hints=hints, reference_date=_crawl_date_kst(job))
                 job.jd_tasks = summary["tasks"]
                 job.jd_stack = summary["stack"]
                 job.jd_employment_type = summary["employment_type"]
@@ -577,6 +578,12 @@ def extract_job() -> dict:
         raise
     finally:
         session.close()
+
+
+def _crawl_date_kst(job: Job) -> date:
+    """공고를 수집한 한국 날짜 — 본문 마감일의 연도를 정하는 기준(analysis/scorer.py::_parse_deadline)."""
+    crawled = job.crawled_at or datetime.now(timezone.utc)
+    return _as_utc(crawled).astimezone(timezone(timedelta(hours=9))).date()
 
 
 # ── Job 2: 분석 ──────────────────────────────────────────────────────────
@@ -636,6 +643,59 @@ def _apply_score(row: JobScore, result: dict, user: User, now: datetime) -> None
     row.rescore_requested_at = None
 
 
+def _direction_only_result(direction: dict) -> dict:
+    """방향 판정에서 걸러진(불일치·분류 안 됨) 공고의 저장값 — 채점하지 않아 점수가 없다."""
+    return {
+        "fit_score": None,
+        "fit_reasons": "",
+        "fit_detail": {
+            "position": direction.get("position", ""),
+            "status": direction["direction"],
+            "direction": direction["direction"],
+            "direction_reason": direction.get("reason", ""),
+            "direction_line": direction.get("line", ""),
+            "direction_line_text": direction.get("line_text", ""),
+            "direction_evidence": direction.get("evidence", ""),
+        },
+    }
+
+
+def _judge_and_score(session, job: Job, user: User, profile_text: str, weights: dict, career: dict,
+                     work_locations: list[str]) -> dict | None:
+    """(공고, 유저) 하나 — 직무 방향 1차 판정 → 일치·부분이면 적합도 채점 (2026-11-11 결정).
+
+    방향 목록이 있으면 JD만 보고 방향을 먼저 판정한다(Gemini 1회, analysis/direction.py). 불일치·분류 안 됨이면
+    채점을 건너뛰고 방향만 돌려준다. 일치·부분이면 방향 목록을 뺀 선호 텍스트로 채점한다(Gemini 1회 더).
+    방향 목록이 없는 유저는 예전처럼 채점만 한다.
+
+    Returns:
+        score_fit 결과 모양의 dict. 방향 판정 뒤 하루 한도가 차면 None — 저장하지 않고 다음 실행에 다시 한다.
+
+    Raises:
+        Exception: 판정·채점 실패. 호출자가 기록하고 다음 조합으로 넘어간다.
+    """
+    direction_prefs = (user.preferences or {}).get("direction")
+    direction = None
+    if direction_options(direction_prefs):
+        _record_gemini_call(session)
+        direction = judge_direction(job.jd_text or "", direction_prefs)
+        if direction["direction"] in ("mismatch", UNCLASSIFIED):
+            return _direction_only_result(direction)
+        if _gemini_budget_exhausted(session):
+            return None
+        time.sleep(_GEMINI_SLEEP_SEC)
+
+    _record_gemini_call(session)
+    preferences_text = build_preferences_text(
+        user.preferences, include_direction=direction is None,
+        picked_position=direction["position"] if direction else "",
+    )
+    return score_fit(
+        jd_text=job.jd_text or "", profile_text=profile_text, preferences_text=preferences_text,
+        weights=weights, career=career, work_locations=work_locations, direction=direction,
+    )
+
+
 def analyze_job() -> None:
     """08:00 KST 체인 2단계 — (Job × User) 조합 fit_score 계산.
 
@@ -669,8 +729,7 @@ def analyze_job() -> None:
             else:
                 logger.warning("[analyze] user_id=%s 이력 없음 — 채점 건너뜀 (scripts/import_profile.py)", user.id)
         users = [user for user in users if user.id in profiles]
-        # 유저별 선호 텍스트·가중치·원하는 근무지 (preferences가 없으면 빈 텍스트·기본값·기본 지역)
-        pref_texts = {u.id: build_preferences_text(u.preferences) for u in users}
+        # 유저별 가중치·원하는 근무지 (preferences가 없으면 기본값·기본 지역). 선호 텍스트는 _judge_and_score가 만든다
         weights = {u.id: weights_of(u.preferences) for u in users}
         careers = {u.id: career_of(u.preferences) for u in users}
         user_locations = {
@@ -732,13 +791,14 @@ def analyze_job() -> None:
                     break
 
                 try:
-                    _record_gemini_call(session)
-                    result = score_fit(
-                        jd_text=job.jd_text or "", profile_text=profiles[user.id],
-                        preferences_text=pref_texts[user.id], weights=weights[user.id],
-                        career=careers[user.id],
-                        work_locations=list(user_locations[user.id] or _TARGET_REGION_KEYWORDS),
+                    result = _judge_and_score(
+                        session, job, user, profiles[user.id], weights[user.id], careers[user.id],
+                        list(user_locations[user.id] or _TARGET_REGION_KEYWORDS),
                     )
+                    if result is None:
+                        logger.warning("[analyze] 방향 판정 뒤 Gemini 한도 도달 — 남은 조합은 다음 실행에 처리")
+                        budget_exhausted = True
+                        break
                     row = JobScore(job_id=job.id, user_id=user.id)
                     _apply_score(row, result, user, datetime.now(timezone.utc))
                     session.add(row)
@@ -771,13 +831,13 @@ def analyze_job() -> None:
                 continue  # 마감된 공고 — 재채점도 Gemini 한도를 쓰지 않는다 (요청 표시는 그대로 둠)
             user = users_by_id[row.user_id]
             try:
-                _record_gemini_call(session)
-                result = score_fit(
-                    jd_text=row.job.jd_text or "", profile_text=profiles[user.id],
-                    preferences_text=pref_texts[user.id], weights=weights[user.id],
-                    career=careers[user.id],
-                    work_locations=list(user_locations[user.id] or _TARGET_REGION_KEYWORDS),
+                result = _judge_and_score(
+                    session, row.job, user, profiles[user.id], weights[user.id], careers[user.id],
+                    list(user_locations[user.id] or _TARGET_REGION_KEYWORDS),
                 )
+                if result is None:
+                    logger.warning("[analyze] 방향 판정 뒤 Gemini 한도 도달 — 남은 재채점은 다음 실행에 처리")
+                    break
                 _apply_score(row, result, user, datetime.now(timezone.utc))
                 session.flush()
                 rescored += 1

@@ -1,5 +1,5 @@
 """스코어러 유닛 테스트 — LLM/DART 모두 mock 처리."""
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -211,23 +211,50 @@ def test_summarize_jd_joins_multiple_text_blocks_and_skips_non_text():
 
 # ── 마감일 파싱·구 점수 판정 (2026-10-15) ───────────────────────────────
 
+REF = date(2026, 10, 20)  # 수집일(한국 날짜)
+
+
 def test_parse_deadline_reads_kst_and_returns_utc():
-    assert _parse_deadline("2026-10-28 23:59") == datetime(2026, 10, 28, 14, 59, tzinfo=timezone.utc)
+    assert _parse_deadline("2026-10-28 23:59", REF) == datetime(2026, 10, 28, 14, 59, tzinfo=timezone.utc)
 
 
 def test_parse_deadline_without_time_means_end_of_day_kst():
-    assert _parse_deadline("2026-10-31") == datetime(2026, 10, 31, 14, 59, tzinfo=timezone.utc)
+    assert _parse_deadline("2026-10-31", REF) == datetime(2026, 10, 31, 14, 59, tzinfo=timezone.utc)
 
 
-@pytest.mark.parametrize("value", [None, "", "null", "상시채용", "10월 28일", 20261028])
+# 마감일 연도는 믿지 않는다 (2026-11-12 결정): 월·일만 쓰고, 수집일 이후 가장 가까운 날짜로 본다.
+# 실제 사례 — Infineon 2025-11-25(수집 11/11), 비테스코: LLM이 연도를 잘못 골라 일찍 삭제되거나 마감으로 보임.
+@pytest.mark.parametrize("value, ref, expected", [
+    ("2025-11-25 23:59", date(2026, 11, 11), datetime(2026, 11, 25, 14, 59, tzinfo=timezone.utc)),
+    ("2026-01-08", date(2026, 12, 23), datetime(2027, 1, 8, 14, 59, tzinfo=timezone.utc)),
+    ("01-08 18:00", date(2026, 12, 23), datetime(2027, 1, 8, 9, 0, tzinfo=timezone.utc)),
+    ("11-11", date(2026, 11, 11), datetime(2026, 11, 11, 14, 59, tzinfo=timezone.utc)),  # 수집일 당일 마감은 올해
+    ("2028-03-02", date(2026, 11, 11), datetime(2027, 3, 2, 14, 59, tzinfo=timezone.utc)),
+])
+def test_parse_deadline_ignores_year_and_picks_next_date_on_or_after_reference(value, ref, expected):
+    assert _parse_deadline(value, ref) == expected
+
+
+def test_parse_deadline_feb_29_in_non_leap_year_is_none():
+    assert _parse_deadline("02-29", date(2026, 11, 11)) is None
+
+
+def test_summary_prompt_asks_month_day_without_year():
+    from analysis.scorer import _SUMMARY_PROMPT
+    text = "\n".join(m.prompt.template for m in _SUMMARY_PROMPT.messages)
+    assert "MM-DD" in text
+    assert "연도는 쓰지 않" in text
+
+
+@pytest.mark.parametrize("value", [None, "", "null", "상시채용", "10월 28일", 20261028, "13-01", "2026-02-30"])
 def test_parse_deadline_rejects_non_dates(value):
-    assert _parse_deadline(value) is None
+    assert _parse_deadline(value, REF) is None
 
 
 def test_summarize_jd_returns_deadline_from_body():
     chain = _mock_fit_chain('{"tasks": [], "deadline": "2026-10-25 23:59"}')
     with patch("analysis.scorer.build_summary_chain", return_value=chain):
-        result = summarize_jd("2026.10.12 (월) ~ 2026.10.25 (일) 23:59까지")
+        result = summarize_jd("2026.10.12 (월) ~ 2026.10.25 (일) 23:59까지", reference_date=REF)
     assert result["deadline"] == datetime(2026, 10, 25, 14, 59, tzinfo=timezone.utc)
 
 

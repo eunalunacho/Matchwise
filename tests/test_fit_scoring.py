@@ -58,10 +58,10 @@ def _score(data, profile_text="프로필", **kwargs) -> dict:
 
 # ── 버전·프롬프트 ───────────────────────────────────────────────────────
 
-def test_scorer_version_is_5():
-    assert SCORER_VERSION == 5
-    assert not is_stale_score(SimpleNamespace(scorer_version=5, profile_version=1), 1)
-    assert is_stale_score(SimpleNamespace(scorer_version=4, profile_version=1), 1)
+def test_scorer_version_is_6():
+    assert SCORER_VERSION == 6
+    assert not is_stale_score(SimpleNamespace(scorer_version=6, profile_version=1), 1)
+    assert is_stale_score(SimpleNamespace(scorer_version=5, profile_version=1), 1)
 
 
 def test_prompt_takes_jd_profile_and_preferences():
@@ -123,6 +123,12 @@ def test_prompt_gates_military_service_only_postings():
         assert word in text
 
 
+def test_prompt_gates_native_level_language_requirement():
+    """하이퍼커넥트 MLE(11/12): 'native-level precision' 영어 요구가 관문에 안 걸려 95점 추천."""
+    text = "\n".join(m.prompt.template for m in _FIT_PROMPT.messages)
+    assert "원어민" in text and "native" in text
+
+
 def test_military_gate_fail_is_ineligible():
     gate = {"military": "fail", "fail_reason": "고용형태: 전문연구요원"}
     result = _score(_answer(gate=gate))
@@ -176,12 +182,42 @@ def test_empty_category_rescales_remaining_points():
 
 
 def test_all_attitude_required_rescales_with_preferred_and_tasks():
-    """필수가 전부 태도형(N)이면 필수 카테고리를 빼고 우대·업무 50점을 100점으로 환산한다."""
+    """필수가 전부 태도형·관문(N)이면 필수 카테고리를 빼고 우대·업무 50점을 100점으로 환산한다.
+    필수 0점 안(11/11)은 자격요건이 관문 문장뿐인 좋은 공고(에이아이티스토리 89 → 44 등)를 떨어뜨려 되돌림."""
     data = _answer(required=_items("N", "N"))
     result = _score(data)
     assert result["fit_detail"]["rates"]["required"] is None
     assert result["fit_detail"]["status"] == "scored"
     assert result["fit_score"] == round((0.5 * 20 + 0.875 * 30) / 50 * 100)
+
+
+def test_empty_required_rescales_with_preferred_and_tasks():
+    data = _answer(required=[], preferred=_items("O", "X", kinds=("normal", "normal")), tasks=_items("O", "O"))
+    result = _score(data)
+    assert result["fit_detail"]["rates"]["required"] is None
+    assert result["fit_score"] == round((0.5 * 20 + 1.0 * 30) / 50 * 100) == 80
+
+
+@pytest.mark.parametrize("tasks", [[], _items("N", "N", "N")])
+def test_no_judgeable_tasks_is_insufficient(tasks):
+    """AWS SA(11/11): 업무 3개가 전부 N → 필수·우대만으로 100점이던 공고."""
+    result = _score(_answer(tasks=tasks))
+    assert result["fit_score"] is None
+    assert result["fit_detail"]["status"] == "insufficient"
+
+
+@pytest.mark.parametrize("item", ["직무소개서 참조 (첨부파일)", "상세 내용은 첨부 파일 참고", "SW개발", " sw 개발 "])
+def test_attachment_or_title_only_task_is_not_judged(item):
+    """삼성메디슨(11/11): 업무 칸에 직함 'SW개발'이나 '직무소개서 참조'만 있어 100점·0점이 나온 공고."""
+    data = _answer(position="SW개발", tasks=[{"item": item, "verdict": "O", "evidence": "SW 개발 프로젝트"}])
+    result = _score(data)
+    assert result["fit_detail"]["tasks"][0]["verdict"] == "N"
+    assert result["fit_detail"]["status"] == "insufficient"
+
+
+def test_real_task_mentioning_reference_is_still_judged():
+    data = _answer(position="SW개발", tasks=[{"item": "사내 레퍼런스를 참고해 API 개발", "verdict": "O", "evidence": "e"}])
+    assert _score(data)["fit_detail"]["tasks"][0]["verdict"] == "O"
 
 
 def test_full_marks_is_100():
@@ -218,6 +254,7 @@ def test_gate_values_are_normalized():
 @pytest.mark.parametrize("overrides", [
     {"info_sufficient": False},
     {"required": [], "tasks": []},
+    {"tasks": []},
     {"required": _items("N"), "tasks": _items("N", "N")},
 ])
 def test_insufficient_when_flag_false_or_no_required_and_tasks(overrides):
@@ -267,6 +304,26 @@ def test_direction_is_normalized(raw, expected):
 def test_direction_reason_is_kept():
     detail = _score(_answer())["fit_detail"]
     assert detail["direction_reason"] == "LLM 서비스 개발"
+
+
+_JUDGED = {"direction": "partial", "line": "P5", "line_text": "Solutions Architect",
+           "evidence": "고객사 아키텍처 자문", "position": "Associate SA", "reason": "고객 대면 설계 자문"}
+
+
+def test_judged_direction_overrides_fit_answer():
+    """방향은 따로 판정한 결과(analysis/direction.py)를 쓴다 — 채점 답의 direction은 무시 (2026-11-11 결정)."""
+    detail = _score(_answer(direction={"verdict": "match", "reason": "경험 보유"}), direction=_JUDGED)["fit_detail"]
+    assert detail["direction"] == "partial"
+    assert detail["direction_reason"] == "고객 대면 설계 자문"
+    assert detail["direction_line"] == "P5"
+    assert detail["direction_evidence"] == "고객사 아키텍처 자문"
+
+
+def test_prompt_uses_position_picked_by_direction_and_skips_title_only_items():
+    text = "\n".join(m.prompt.template for m in _FIT_PROMPT.messages)
+    assert "방향 판정에서 고른 직무" in text
+    assert "직무소개서 참조" in text
+    assert "직함만" in text
 
 
 def test_fit_detail_keeps_position_and_items():

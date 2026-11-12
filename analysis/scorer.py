@@ -8,7 +8,7 @@ company_score: 당분간 비활성화 — 수집→fit 계산→추천 흐름을
 import json
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
@@ -23,7 +23,8 @@ logger = logging.getLogger(__name__)
 # fit 채점 v3(2026-10-27 결정, 위키 취준/평가기준.md). LLM은 관문·항목별 판정·직무 방향만 내고,
 # 점수·상태는 _compute_fit_score()가 계산한다.
 #   점수 = 필수 충족률×50 + 우대 충족률×20 + 업무 겹침률×30
-#   판정 가능한 항목이 없는 카테고리는 빼고 남은 배점으로 100점 환산
+#   빈칸 처리(2026-11-11 결정): 업무에 판정 가능한 항목이 없으면 판단 불가. 필수·우대에 없으면 그 카테고리를 빼고
+#   남은 배점으로 100점 환산 (필수가 관문 문장뿐인 공고가 많아 필수 0점 안은 되돌림)
 CATEGORY_POINTS: dict[str, int] = {"required": 50, "preferred": 20, "tasks": 30}
 # 관문 — 하나라도 fail이면 지원 불가(ineligible), 점수 없음. 근무지·마감은 코드가 따로 본다.
 #   degree 학위 / graduation 졸업(예정) 시한 / career 필수 경력 / language 주 사용 언어 / cert 필수 어학·자격
@@ -51,7 +52,9 @@ _REQUIRED_KINDS = ("normal", "career")
 #   4: 관문 문장(학력·전공·신입/경력 무관·입사 시점)도 N — 필수 점수에서 제외(2026-10-30)
 #   5: 고른 직무의 근무지(position_location)가 원하는 지역 밖이면 지원 불가, 병역특례(전문연구요원·산업기능요원)
 #      전용 공고는 병역 비대상·군필이면 지원 불가(관문 military)(2026-11-02)
-SCORER_VERSION = 5
+#   6: 업무에 판정 가능한 항목이 없으면 판단 불가, 직함만·"첨부 참조"인 업무는 N,
+#      직무 방향은 따로 판정(analysis/direction.py)한 결과를 씀(2026-11-11), 원어민 수준 어학 요구는 관문 cert fail(2026-11-12)
+SCORER_VERSION = 6
 
 
 def is_stale_score(score, user_profile_version: int) -> bool:
@@ -86,6 +89,7 @@ _FIT_PROMPT = ChatPromptTemplate.from_messages([
    position_location은 고른 직무의 근무지다. 직무별로 근무지가 따로 적혀 있으면 그 직무의 근무지를 시/도부터 쓴다.
    "본사"·"공장"처럼 줄여 적었으면 공고의 근무지 주소 목록에서 찾아 풀어 쓴다 (예: "광주 (본사)" → "광주 광산구 하남산단5번로 33").
    모든 직무가 같은 근무지이거나 근무지가 적혀 있지 않으면 빈 문자열.
+   [지원 조건·선호]에 "방향 판정에서 고른 직무"가 있으면 그 직무를 고른다.
 
 2. 정보 충분성 (info_sufficient)
    담당업무와 자격요건이 둘 다 없거나, 본문이 비어 있거나 이미지·별도 파일이라 내용을 읽을 수 없으면 false.
@@ -96,7 +100,8 @@ _FIT_PROMPT = ChatPromptTemplate.from_messages([
    - graduation: 공고가 허용하는 졸업(예정) 시한·졸업자 한정 조건
    - career: 필수 경력 연차 — [지원 조건·선호]의 허용 경력(max_required_years)을 넘을 때만 "fail". 그 이하면 "pass"
    - language: 메인·필수 프로그래밍 언어 (코딩테스트 언어 포함)
-   - cert: 필수 어학 점수·필수 자격증
+   - cert: 필수 어학 점수·필수 자격증. 원어민 수준 어학을 필수로 요구하면(예: "native-level", "native speaker",
+     "원어민 수준", "Native-level precision") [지원자 사실]의 어학이 원어민이 아닌 한 "fail"
    - military: 병역특례 전용 채용 — [지원자 사실]의 병역이 비대상·군필·면제인데, 공고가 전문연구요원·산업기능요원만
      뽑는다고 명시하면 "fail". 명시란 다음 중 하나다: 고용형태가 전문연구요원·산업기능요원 (예: "고용형태: 전문연구요원"),
      지원자격·필수 요건에 병역특례 대상·복무 가능자가 들어 있음 (예: "전문연구요원으로 복무 가능한 분", "병역특례 대상자"),
@@ -115,6 +120,8 @@ _FIT_PROMPT = ChatPromptTemplate.from_messages([
    | "이런 분을 기다려요" 형식 | 기다리는 분 | 더 좋아요 | 담당 업무 |
    | NCS 직무기술서 | 필요기술 | 필요지식 | 직무수행내용 ("기타"는 제외) |
    item에는 공고 문구를 그대로(길면 핵심만 줄여) 쓴다. 공고에 없는 칸은 빈 배열로 둔다.
+   직함만 적힌 문구(예: 담당업무 "SW개발")나 "직무소개서 참조"·"첨부파일 참고"처럼 내용이 본문에 없는 문구는
+   항목으로 넣지 않는다. 그래서 담당업무를 읽을 수 없으면 tasks는 빈 배열이고 info_sufficient는 false다.
    관문(학위·졸업·어학 점수)만 적은 문장은 gate에서 판정하고 required에 넣지 않는다.
    필수 경력 연차 문장(예: "경력 1년 이상", "실무 경력 18개월 이상")은 required에 넣고 kind를 "career",
    years에 요구 연차를 숫자로 적는다(개월이면 12로 나눈다. 예: 18개월 → 1.5). 그 밖의 required 항목은 kind "normal".
@@ -185,12 +192,13 @@ JD:
   - evidence: 판단 근거가 된 원문 문장 그대로(한국어). 근거 없으면 빈 문자열
 - locations: 근무지 목록. 원문에 적힌 주소·지역명을 시/도부터 그대로 (예: "서울 강남구", "경기 성남시 분당구 판교역로").
   근무지가 여러 곳이면 모두, 명시가 없으면 빈 배열
-- deadline: 서류 접수 마감 일시. "YYYY-MM-DD HH:MM"(24시간제, 한국 시간), 시간이 없으면 "YYYY-MM-DD".
-  접수 기간이 "10월 12일 ~ 10월 28일 23:59"처럼 적혀 있으면 끝 날짜를 쓴다. 연도가 없으면 공고 맥락의 연도.
+- deadline: 서류 접수 마감 월·일·시각. "MM-DD HH:MM"(24시간제, 한국 시간), 시간이 없으면 "MM-DD".
+  연도는 쓰지 않는다 — 연도는 코드가 수집일 기준으로 정한다.
+  접수 기간이 "10월 12일 ~ 10월 28일 23:59"처럼 적혀 있으면 끝 날짜를 쓴다 (예: "10-28 23:59").
   "상시채용", "채용 시 마감"처럼 날짜가 없으면 null. 서류 마감이 아닌 일정(발표일·면접일)은 쓰지 않는다
 
 아래 JSON 형식으로만 답하세요:
-{{"tasks": ["<업무>"], "stack": ["<기술>"], "employment_type": "<고용형태>", "qualifications": ["<자격요건>"], "preferred": ["<우대사항>"], "eligibility": {{"new_grad_ok": <true|false|null>, "min_years": <정수|null>, "evidence": "<원문 문장>"}}, "locations": ["<근무지>"], "deadline": "<YYYY-MM-DD HH:MM 또는 null>"}}
+{{"tasks": ["<업무>"], "stack": ["<기술>"], "employment_type": "<고용형태>", "qualifications": ["<자격요건>"], "preferred": ["<우대사항>"], "eligibility": {{"new_grad_ok": <true|false|null>, "min_years": <정수|null>, "evidence": "<원문 문장>"}}, "locations": ["<근무지>"], "deadline": "<MM-DD HH:MM 또는 null>"}}
 """),
 ])
 
@@ -383,15 +391,34 @@ def _location_gate(position_location: str, work_locations: list[str] | None) -> 
     return "pass" if any(kw in position_location for kw in work_locations) else "fail"
 
 
+# 업무 칸에 들어왔지만 내용이 본문에 없는 문구 — 판정하지 않는다(N)
+# (공백을 뺀 문구에 적용) "직무소개서 참조 (첨부파일)", "상세 내용은 첨부 파일 참고", "직무기술서 참고"
+_ATTACHMENT_ONLY = re.compile(r"첨부|직무(소개|기술)서.{0,3}(참조|참고)")
+_SPACES = re.compile(r"\s+")
+
+
+def _blank_out_unreadable_tasks(tasks: list[dict], position: str) -> None:
+    """직함만 적힌 업무(position과 같은 문구)와 "직무소개서 참조"류 업무를 N으로 바꾼다.
+
+    삼성메디슨(2026-11-11): 업무 칸에 "SW개발" 한 줄 → O → 100점, 같은 공고 다른 사이트는 "직무소개서 참조" → X → 0점.
+    """
+    title = _SPACES.sub("", position).lower()
+    for item in tasks:
+        text = _SPACES.sub("", item["item"]).lower()
+        if _ATTACHMENT_ONLY.search(text) or (title and text == title):
+            item["verdict"] = "N"
+            item["evidence"] = ""
+
+
 def _compute_fit_score(
     data: dict, weights: dict[str, float], career: dict | None = None,
-    work_locations: list[str] | None = None,
+    work_locations: list[str] | None = None, direction: dict | None = None,
 ) -> tuple[int | None, dict]:
     """LLM 판정(관문·항목·방향) → (점수, fit_detail).
 
-    상태: 관문에 fail → "ineligible", info_sufficient가 false이거나 필수·업무에 판정 가능한 항목이
-    하나도 없으면 → "insufficient", 그 외 "scored". ineligible·insufficient는 점수 None.
-    점수 = Σ(카테고리 충족률 × CATEGORY_POINTS) — 충족률이 None인 카테고리는 빼고 남은 배점으로 100점 환산.
+    상태: 관문에 fail → "ineligible", info_sufficient가 false이거나 업무에 판정 가능한 항목이 없으면
+    → "insufficient", 그 외 "scored". ineligible·insufficient는 점수 None.
+    점수 = Σ(카테고리 충족률 × CATEGORY_POINTS) — 충족률이 None인 카테고리(필수·우대)는 빼고 남은 배점으로 100점 환산.
 
     Args:
         data: LLM 답 JSON.
@@ -400,6 +427,7 @@ def _compute_fit_score(
             경력 항목은 months ÷ (요구 연차×12)로 점수를 주고, 요구 연차가 max_years를 넘으면 관문 fail.
         work_locations: 원하는 근무지 키워드. 고른 직무의 근무지(position_location)에 하나도 없으면
             gate["location"] = "fail"(지원 불가). None/빈 목록이면 판정하지 않는다.
+        direction: 따로 판정한 직무 방향(analysis/direction.py::judge_direction). 있으면 채점 답의 direction 대신 쓴다.
 
     Returns:
         (0~100 정수 또는 None, fit_detail dict).
@@ -417,6 +445,7 @@ def _compute_fit_score(
     }
     career = career if career is not None else career_of(None)
     _apply_career_credit(categories["required"], career)
+    _blank_out_unreadable_tasks(categories["tasks"], str(data.get("position") or ""))
     rates = {key: _category_rate(items, weights) for key, items in categories.items()}
 
     raw_gate = data.get("gate") if isinstance(data.get("gate"), dict) else {}
@@ -440,7 +469,7 @@ def _compute_fit_score(
 
     if any(gate[key] == "fail" for key in (*GATE_KEYS, "location")):
         status = "ineligible"
-    elif info_sufficient is False or (rates["required"] is None and rates["tasks"] is None):
+    elif info_sufficient is False or rates["tasks"] is None:
         status = "insufficient"
     else:
         status = "scored"
@@ -451,15 +480,20 @@ def _compute_fit_score(
         earned = sum(rate * CATEGORY_POINTS[k] for k, rate in rates.items() if rate is not None)
         total = round(earned * 100 / possible) if possible else None
 
-    direction, direction_reason = _normalize_direction(data.get("direction"))
+    if direction:
+        direction_value, direction_reason = direction.get("direction", ""), str(direction.get("reason") or "")
+    else:
+        direction_value, direction_reason = _normalize_direction(data.get("direction"))
     detail = {
         "position": str(data.get("position") or ""),
         "position_location": position_location,
         "status": status,
         "gate": gate,
         **categories,
-        "direction": direction,
+        "direction": direction_value,
         "direction_reason": direction_reason,
+        **({"direction_line": direction.get("line", ""), "direction_evidence": direction.get("evidence", "")}
+           if direction else {}),
         "rates": rates,
         "weak_points": str(data.get("weak_points") or ""),
     }
@@ -473,6 +507,7 @@ def score_fit(
     weights: dict[str, float] | None = None,
     career: dict | None = None,
     work_locations: list[str] | None = None,
+    direction: dict | None = None,
 ) -> dict:
     """JD × 지원자 사실 × 지원 조건·선호 → fit_score(코드 계산) + fit_reasons + fit_detail.
 
@@ -486,6 +521,7 @@ def score_fit(
         weights: 우대 kind별 가중치. None이면 기본값(weights_of(None)).
         career: 경력 비율 점수 설정. None이면 기본값(career_of(None) — 비율 계산 없이 판정 그대로).
         work_locations: 원하는 근무지 키워드. 고른 직무의 근무지가 밖이면 지원 불가. None이면 판정 안 함.
+        direction: 따로 판정한 직무 방향(analysis/direction.py::judge_direction). None이면 채점 답의 direction을 쓴다.
 
     Returns:
         {"fit_score": int | None, "fit_reasons": str, "fit_detail": dict}. 지원 불가·판단 불가면 fit_score None.
@@ -501,7 +537,7 @@ def score_fit(
     })
     data = _parse_json(_response_text(response))
     total, detail = _compute_fit_score(
-        data, weights if weights is not None else weights_of(None), career, work_locations,
+        data, weights if weights is not None else weights_of(None), career, work_locations, direction,
     )
     return {
         "fit_score": total,
@@ -538,29 +574,45 @@ def _parse_eligibility(data: dict) -> dict:
 _KST = timezone(timedelta(hours=9))
 
 
-def _parse_deadline(value) -> datetime | None:
-    """요약의 deadline 문자열(한국 시간) → UTC datetime. 시간이 없으면 그날 23:59. 형식이 다르면 None."""
+_DEADLINE_RE = re.compile(r"^(?:\d{4}-)?(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?$")
+
+
+def _parse_deadline(value, reference: date) -> datetime | None:
+    """요약의 deadline 문자열(한국 시간) → UTC datetime. 시간이 없으면 그날 23:59. 형식이 다르면 None.
+
+    연도는 믿지 않는다(2026-11-12 결정): "MM-DD"·"YYYY-MM-DD" 어느 쪽이든 월·일만 쓰고, 수집일(reference) 당일 또는
+    그 이후 가장 가까운 날짜로 연도를 정한다. 예: 12/23 수집 공고의 "01-08" → 다음 해 1월 8일.
+    LLM이 연도를 잘못 골라(Infineon 2025-11-25) 공고가 마감된 것으로 보이거나 일찍 삭제되던 문제를 막는다.
+
+    Args:
+        value: 요약의 deadline 값.
+        reference: 수집일(한국 날짜).
+    """
     if not isinstance(value, str):
         return None
-    text = value.strip()
-    for fmt, has_time in (("%Y-%m-%d %H:%M", True), ("%Y-%m-%d", False)):
+    match = _DEADLINE_RE.match(value.strip())
+    if not match:
+        return None
+    month, day = int(match.group(1)), int(match.group(2))
+    hour, minute = (int(match.group(3)), int(match.group(4))) if match.group(3) else (23, 59)
+    for year in (reference.year, reference.year + 1):
         try:
-            parsed = datetime.strptime(text, fmt)
+            candidate = datetime(year, month, day, hour, minute, tzinfo=_KST)
         except ValueError:
-            continue
-        if not has_time:
-            parsed = parsed.replace(hour=23, minute=59)
-        return parsed.replace(tzinfo=_KST).astimezone(timezone.utc)
+            return None  # 없는 날짜(13월, 2/30, 평년 2/29)
+        if candidate.date() >= reference:
+            return candidate.astimezone(timezone.utc)
     return None
 
 
-def summarize_jd(jd_text: str, hints: dict | None = None) -> dict:
+def summarize_jd(jd_text: str, hints: dict | None = None, reference_date: date | None = None) -> dict:
     """JD 원문(+선택적 채용구분 힌트) → 카드용 요약 + 신입 지원 가능 여부(eligibility) + 근무지(locations).
 
     hints는 크롤러가 채운 {"positions": [{"career_level": str, ...}]} 형태(자소설/잡코리아 등).
     JD 원문이 우선 근거이며, 힌트와 충돌하면 원문을 따르고 그 사실을 eligibility.evidence에 남기도록
     프롬프트에 지시한다. 알림 카드(제목·고용형태·'하는 일')와 상세 분석에 사용한다.
     deadline은 본문에 적힌 서류 마감(UTC datetime, 없으면 None) — 목록에 마감일이 없는 사이트(인디스워크)용.
+    연도는 reference_date(수집일, 한국 날짜. 없으면 오늘) 이후 가장 가까운 날짜로 정한다.
     파싱 실패 시 빈 구조를 반환해 카드에서 해당 블록이 생략되게 한다.
     """
     response = build_summary_chain().invoke({
@@ -583,7 +635,7 @@ def summarize_jd(jd_text: str, hints: dict | None = None) -> dict:
         "preferred": _str_list("preferred", 5),
         "eligibility": _parse_eligibility(data),
         "locations": _str_list("locations", 10),
-        "deadline": _parse_deadline(data.get("deadline")),
+        "deadline": _parse_deadline(data.get("deadline"), reference_date or datetime.now(_KST).date()),
     }
 
 

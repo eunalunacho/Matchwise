@@ -13,9 +13,25 @@ def _detail(direction="match", status="scored"):
 
 
 def test_constants():
-    assert GRADES == ("closed", "ineligible", "insufficient", "recommend", "suggest", "reference", "not_recommended")
+    assert GRADES == ("closed", "ineligible", "insufficient", "unclassified",
+                      "recommend", "suggest", "reference", "not_recommended")
     assert NOTIFY_GRADES == ("recommend", "suggest")
-    assert [GRADE_LABELS[g] for g in GRADES] == ["마감", "지원 불가", "판단 불가", "추천", "권유", "참고", "비추천"]
+    assert [GRADE_LABELS[g] for g in GRADES] == ["마감", "지원 불가", "판단 불가", "분류 안 됨",
+                                                 "추천", "권유", "참고", "비추천"]
+
+
+def test_direction_mismatch_without_score_is_not_recommended():
+    """방향 판정에서 불일치면 채점을 건너뛰어 점수가 없다 — 판단 불가가 아니라 비추천 (2026-11-11)."""
+    assert grade_for(None, _detail(direction="mismatch", status="mismatch"), None, NOW, CFG) == "not_recommended"
+
+
+def test_unclassified_direction_is_its_own_grade():
+    assert grade_for(None, _detail(direction="unclassified", status="unclassified"), None, NOW, CFG) == "unclassified"
+
+
+def test_closed_wins_over_unclassified():
+    detail = _detail(direction="unclassified", status="unclassified")
+    assert grade_for(None, detail, NOW - timedelta(days=1), NOW, CFG) == "closed"
 
 
 def test_closed_when_deadline_passed():

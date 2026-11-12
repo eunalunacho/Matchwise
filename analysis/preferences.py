@@ -45,7 +45,9 @@ def _lines(section) -> list[str]:
     ]
 
 
-def build_preferences_text(preferences: dict | None) -> str:
+def build_preferences_text(
+    preferences: dict | None, include_direction: bool = True, picked_position: str = "",
+) -> str:
     """채점 프롬프트에 넣을 지원 조건·선호 텍스트. 넣을 게 없으면 빈 문자열.
 
     constraints, item_rules, direction(match/partial/mismatch)만 펼친다.
@@ -53,6 +55,9 @@ def build_preferences_text(preferences: dict | None) -> str:
 
     Args:
         preferences: users.preferences (없으면 None).
+        include_direction: False면 직무 방향 목록을 넣지 않는다 — 방향을 따로 판정할 때(analysis/direction.py).
+            채점 LLM이 목록을 보면 지원자 이력에 끌려 방향을 다시 판단하기 때문(2026-11-11 결정).
+        picked_position: 방향 판정에서 고른 직무. 있으면 채점도 그 직무 기준으로 하도록 한 줄 넣는다.
 
     Returns:
         "[지원 조건]", "[항목 판정 규칙]", "[직무 방향]" 블록이 빈 줄로 이어진 텍스트.
@@ -68,7 +73,10 @@ def build_preferences_text(preferences: dict | None) -> str:
     if rules:
         sections.append("[항목 판정 규칙]\n" + "\n".join(rules))
 
-    direction = prefs.get("direction")
+    if picked_position:
+        sections.append(f"방향 판정에서 고른 직무: {picked_position}")
+
+    direction = prefs.get("direction") if include_direction else None
     if isinstance(direction, dict):
         dir_lines = []
         for key, label in _DIRECTION_LABELS.items():
